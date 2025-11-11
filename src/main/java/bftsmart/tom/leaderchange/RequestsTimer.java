@@ -76,6 +76,10 @@ public class RequestsTimer {
     public void setShortTimeout(long shortTimeout) {
         this.shortTimeout = shortTimeout;
     }
+
+    public long getTimeout() {
+        return (shortTimeout > -1 ? shortTimeout : timeout);
+    }
     
     public void startTimer() {
         if (rtTask == null) {

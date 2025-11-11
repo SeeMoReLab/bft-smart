@@ -2,6 +2,7 @@ plugins {
 	id 'java'
 	id 'distribution'
 	id 'org.hidetake.ssh' version '2.10.1'
+	id 'com.google.protobuf' version '0.9.4'
 }
 
 group 'BFT-SMaRt'
@@ -20,6 +21,9 @@ jar {
 	archivesBaseName='BFT-SMaRt'
 	project.version=""
 }
+
+def grpcVersion = '1.59.0'
+def protobufVersion = '3.24.0'
 
 ssh.settings {
 	fileTransfer = 'scp'
@@ -191,4 +195,36 @@ dependencies {
 
 	// https://mvnrepository.com/artifact/org.slf4j/slf4j-api
 	implementation 'org.slf4j:slf4j-api:1.7.32'
+
+	// gRPC dependencies
+	implementation "io.grpc:grpc-netty-shaded:${grpcVersion}"
+	implementation "io.grpc:grpc-protobuf:${grpcVersion}"
+	implementation "io.grpc:grpc-stub:${grpcVersion}"
+	compileOnly "org.apache.tomcat:annotations-api:6.0.53"
+	implementation "com.google.protobuf:protobuf-java:${protobufVersion}"
+}
+
+protobuf {
+	protoc {
+		artifact = "com.google.protobuf:protoc:${protobufVersion}"
+	}
+	plugins {
+		grpc {
+			artifact = "io.grpc:protoc-gen-grpc-java:${grpcVersion}"
+		}
+	}
+	generateProtoTasks {
+		all()*.plugins {
+			grpc {}
+		}
+	}
+}
+
+sourceSets {
+	main {
+		java {
+			srcDirs 'build/generated/source/proto/main/grpc'
+			srcDirs 'build/generated/source/proto/main/java'
+		}
+	}
 }

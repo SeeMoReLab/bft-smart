@@ -29,6 +29,7 @@ import bftsmart.consensus.roles.Proposer;
 import bftsmart.reconfiguration.ReconfigureReply;
 import bftsmart.reconfiguration.ServerViewController;
 import bftsmart.reconfiguration.VMMessage;
+import bftsmart.rlrpc.RLRPCServer;
 import bftsmart.tom.core.ReplyManager;
 import bftsmart.tom.core.TOMLayer;
 import bftsmart.tom.core.messages.TOMMessage;
@@ -78,7 +79,7 @@ public class ServiceReplica {
     private ReplicaContext replicaCtx = null;
     private Replier replier = null;
     private RequestVerifier verifier = null;
-
+    private RLRPCServer rlrpcServer = null;
     /**
      * Constructor
      *
@@ -151,6 +152,13 @@ public class ServiceReplica {
             throw new RuntimeException("Unable to build a communication system.");
         }
 
+        try {
+            rlrpcServer = new RLRPCServer(this.id, 50051 + this.id);
+        } catch (Exception ex){
+            logger.error("Failed to initialize gRPC system", ex);
+            throw new RuntimeException("Unable to build gRPC server.");
+        }
+
         if (this.SVController.isInCurrentView()) {
             logger.info("In current view: " + this.SVController.getCurrentView());
             initTOMLayer(); // initiaze the TOM layer
@@ -188,6 +196,14 @@ public class ServiceReplica {
     private void initReplica() {
         cs.start();
         repMan = new ReplyManager(SVController.getStaticConf().getNumRepliers(), cs);
+        try {
+            rlrpcServer.start();
+            // rlrpcServer.blockUntilShutdown();
+            
+        } catch (Exception ex) {
+            logger.error("Failed to initialize RPC server", ex);
+            throw new RuntimeException("Unable to build RLRPC server");
+        }
     }
 
     public final void receiveReadonlyMessage(TOMMessage message, MessageContext msgCtx) {
@@ -476,6 +492,7 @@ public class ServiceReplica {
 
         cs.setTOMLayer(tomLayer);
         cs.setRequestReceiver(tomLayer);
+        rlrpcServer.setTomLayer(tomLayer);
 
         acceptor.setTOMLayer(tomLayer);
 
