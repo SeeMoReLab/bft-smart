@@ -23,12 +23,13 @@ public class MapServer<K, V> extends DefaultSingleRecoverable {
 	private Logger logger;
 	private Storage consensusLatency = null;
 	private int iterations = 0;
+	private ServiceReplica serviceReplica = null;
 
 	public MapServer(int id) {
 		replicaMap = new TreeMap<>();
 		logger = Logger.getLogger(MapServer.class.getName());
 		consensusLatency = new Storage(10);
-		new ServiceReplica(id, this, this);
+		this.serviceReplica = new ServiceReplica(id, this, this);
 	}
 
 	public static void main(String[] args) {
@@ -45,10 +46,19 @@ public class MapServer<K, V> extends DefaultSingleRecoverable {
 			MapMessage<K,V> response = new MapMessage<>();
 			MapMessage<K,V> request = MapMessage.fromBytes(command);
 			MapRequestType cmd = request.getType();
-			
+			System.out.println("Start time: " + msgCtx.getFirstInBatch().consensusStartTime + ", decision time: " + msgCtx.getFirstInBatch().decisionTime);
 			consensusLatency.store(msgCtx.getFirstInBatch().decisionTime - msgCtx.getFirstInBatch().consensusStartTime);
 			iterations++;
-			if (iterations % 10 == 0) {
+			if (iterations % 5 == 0) {
+				
+				this.serviceReplica.getLearningAgentClient()
+					.predict(
+						10,
+						(float) consensusLatency.getAverage(false) / 1000,
+						(float) consensusLatency.getMax(false) / 1000,
+						(float) consensusLatency.getMin(false) / 1000,
+						(float) consensusLatency.getDP(true) / 1000
+					);
 				System.out.println("Consensus latency = " + consensusLatency.getAverage(false) / 1000 + " (+/- "+ (long)consensusLatency.getDP(false) / 1000 +") us ");
             	consensusLatency.reset();
 			}

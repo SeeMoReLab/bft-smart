@@ -62,6 +62,11 @@ public class Storage {
         long[] values = java.util.Arrays.copyOfRange(this.values, 0, count);
         return computeMax(values,limit);
     }
+
+    public long getMin(boolean limit){
+        long[] values = java.util.Arrays.copyOfRange(this.values, 0, count);
+        return computeMin(values,limit);
+    }
     
     private double computeAverage(long[] values, boolean percent){
         java.util.Arrays.sort(values);
@@ -89,6 +94,21 @@ public class Storage {
             }
         }
         return max;
+    }
+
+     private long computeMin(long[] values, boolean percent){
+        java.util.Arrays.sort(values);
+        int limit = 0;
+        if(percent){
+            limit = values.length/10;
+        }
+        long min = values[limit];
+        for(int i = limit+1; i < values.length - limit;i++){
+            if (values[i]<min){
+                min = values[i];
+            }
+        }
+        return min;
     }
     
     private double computeDP(long[] values, boolean percent){

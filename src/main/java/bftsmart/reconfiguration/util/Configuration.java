@@ -283,6 +283,11 @@ public class Configuration {
 		return hosts.getPort(id);
 	}
 
+	/* Adaptive Timers */
+	public final int getLearnerPort(int id) {
+		return hosts.getLearnerPort(id);
+	}
+
 	public final int getServerToServerPort(int id) {
 		return hosts.getServerToServerPort(id);
 	}

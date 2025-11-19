@@ -62,6 +62,15 @@ public class HostsConfig {
                         int portRR = Integer.valueOf(str.nextToken());
                         this.servers.put(id, new Config(id, host, port, portRR));
                     }
+                    /* Adaptive Timers */
+                    else if(str.countTokens() == 5){
+                        int id = Integer.valueOf(str.nextToken());
+                        String host = str.nextToken();
+                        int port = Integer.valueOf(str.nextToken());
+                        int portRR = Integer.valueOf(str.nextToken());
+                        int learnerPort = Integer.valueOf(str.nextToken());
+                        this.servers.put(id, new Config(id, host, port, portRR, learnerPort));
+                    }
                 }
             }
             fr.close();
@@ -103,6 +112,14 @@ public class HostsConfig {
         Config c = (Config) this.servers.get(id);
         if(c != null){
             return c.port;
+        }
+        return -1;
+    }
+
+    public int getLearnerPort(int id) {
+        Config c = (Config) this.servers.get(id);
+        if(c != null){
+            return c.learnerPort;
         }
         return -1;
     }
@@ -160,7 +177,16 @@ public class HostsConfig {
         public String host;
         public int port;
         public int portRR;
-        
+        public int learnerPort;
+
+        public Config(int id, String host, int port, int portRR, int learnerPort){
+            this.id = id;
+            this.host = host;
+            this.port = port;
+            this.portRR = portRR;
+            this.learnerPort = learnerPort;
+        }
+
         public Config(int id, String host, int port, int portRR){
             this.id = id;
             this.host = host;

@@ -35,7 +35,7 @@ for ((i=0; i<NUM_REPLICAS; i++)); do
   echo "Starting replica $i..."
   osascript <<EOF
 tell application "Terminal"
-    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.demo.map.MapServer $i"
+    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.benchmark.ThroughputLatencyServer $i 64"
 end tell
 EOF
 done
@@ -44,7 +44,7 @@ REPLICA_DIR="$(cd "$PROJECT_DIR/replica0" && pwd)"
 sleep 2s
 osascript <<EOF
 tell application "Terminal"
-    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.demo.map.MapInteractiveClient 0"
+    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.benchmark.ThroughputLatencyClient 0 10 1000 32 true true true"
 end tell
 EOF
 

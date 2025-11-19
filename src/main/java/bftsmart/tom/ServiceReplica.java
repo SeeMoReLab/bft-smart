@@ -29,12 +29,13 @@ import bftsmart.consensus.roles.Proposer;
 import bftsmart.reconfiguration.ReconfigureReply;
 import bftsmart.reconfiguration.ServerViewController;
 import bftsmart.reconfiguration.VMMessage;
-import bftsmart.rlrpc.RLRPCServer;
+import bftsmart.rlrpc.LearningAgentClient;
 import bftsmart.tom.core.ReplyManager;
 import bftsmart.tom.core.TOMLayer;
 import bftsmart.tom.core.messages.TOMMessage;
 import bftsmart.tom.core.messages.TOMMessageType;
 import bftsmart.tom.leaderchange.CertifiedDecision;
+import bftsmart.tom.leaderchange.RequestsTimer;
 import bftsmart.tom.server.BatchExecutable;
 import bftsmart.tom.server.Executable;
 import bftsmart.tom.server.Recoverable;
@@ -79,7 +80,10 @@ public class ServiceReplica {
     private ReplicaContext replicaCtx = null;
     private Replier replier = null;
     private RequestVerifier verifier = null;
-    private RLRPCServer rlrpcServer = null;
+
+    /* Adaptive Timers */
+    private LearningAgentClient learningAgentClient = null;
+
     /**
      * Constructor
      *
@@ -152,11 +156,20 @@ public class ServiceReplica {
             throw new RuntimeException("Unable to build a communication system.");
         }
 
+        /* Adaptive timers */
         try {
-            rlrpcServer = new RLRPCServer(this.id, 50051 + this.id);
+            String host = this.SVController.getStaticConf().getHost(this.id);
+            int learnerPort = this.SVController.getStaticConf().getLearnerPort(this.id);
+            if (learnerPort > 0) {
+                this.learningAgentClient = new LearningAgentClient(host, learnerPort);
+                System.out.println("Created learner client: " + host + " " + learnerPort);
+            } else {
+                System.out.println("Could not create learner client. LearnerPort is " + learnerPort);
+            }
+            
         } catch (Exception ex){
-            logger.error("Failed to initialize gRPC system", ex);
-            throw new RuntimeException("Unable to build gRPC server.");
+            logger.error("Failed to initialize learning agent client", ex);
+            throw new RuntimeException("Unable to build learning agent client.");
         }
 
         if (this.SVController.isInCurrentView()) {
@@ -196,14 +209,6 @@ public class ServiceReplica {
     private void initReplica() {
         cs.start();
         repMan = new ReplyManager(SVController.getStaticConf().getNumRepliers(), cs);
-        try {
-            rlrpcServer.start();
-            // rlrpcServer.blockUntilShutdown();
-            
-        } catch (Exception ex) {
-            logger.error("Failed to initialize RPC server", ex);
-            throw new RuntimeException("Unable to build RLRPC server");
-        }
     }
 
     public final void receiveReadonlyMessage(TOMMessage message, MessageContext msgCtx) {
@@ -492,7 +497,6 @@ public class ServiceReplica {
 
         cs.setTOMLayer(tomLayer);
         cs.setRequestReceiver(tomLayer);
-        rlrpcServer.setTomLayer(tomLayer);
 
         acceptor.setTOMLayer(tomLayer);
 
@@ -533,5 +537,16 @@ public class ServiceReplica {
      */
     public int getId() {
         return id;
+    }
+
+    /* Adaptive Timers */
+    /**
+     * Learning Agent's gRPC client */
+    public LearningAgentClient getLearningAgentClient() {
+        return learningAgentClient;
+    }
+
+    public RequestsTimer getRequestsTimer() {
+        return tomLayer.requestsTimer;
     }
 }
