@@ -171,6 +171,15 @@ public class ServiceProxy extends TOMSender {
 		return invoke(request, TOMMessageType.UNORDERED_REQUEST);
 	}
 
+    /**
+     * Adaptive Timers
+     * This method sends an injection
+     * @param request injection config
+     */
+    public void invokeInjection(byte[] request) {
+        invoke(request, TOMMessageType.INJECTION_REQUEST);
+    }
+
 	/**
 	 * This method sends an unordered request to the replicas, and returns the related reply.
 	 * This method chooses randomly one replica to send the complete response, while the others
@@ -201,8 +210,15 @@ public class ServiceProxy extends TOMSender {
 			canSendLock.lock();
 
 			requestHandler = createRequestHandler(reqType);
-
-			TOMMessage requestMessage = requestHandler.createRequest(request);
+            TOMMessage requestMessage;
+            if (reqType == TOMMessageType.INJECTION_REQUEST) {
+                System.out.println("Creating injection request");
+                requestMessage = requestHandler.createInjection(request);
+                TOMulticast(requestMessage);
+                return null;
+            } else {
+                requestMessage = requestHandler.createRequest(request);
+            }
 
 			logger.debug("Sending request ({}) with seqId = {}", reqType, requestHandler.getSequenceId());
 			TOMulticast(requestMessage);

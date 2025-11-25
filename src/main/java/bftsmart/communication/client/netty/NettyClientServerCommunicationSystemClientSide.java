@@ -314,7 +314,7 @@ public class NettyClientServerCommunicationSystemClientSide extends SimpleChanne
 			if (channel.isActive()) {
 				sm.signed = sign;
 				ChannelFuture f = channel.writeAndFlush(sm);
-
+                if (sm.isInjection()) continue;
 				f.addListener(listener);
 
 				sent++;
@@ -322,6 +322,8 @@ public class NettyClientServerCommunicationSystemClientSide extends SimpleChanne
 				logger.debug("Channel to " + target + " is not connected");
 			}
 		}
+
+        if (sm.isInjection()) return;
 
 		if (targets.length > controller.getCurrentViewF() && sent < controller.getCurrentViewF() + 1) {
 			// if less than f+1 servers are connected send an exception to the client

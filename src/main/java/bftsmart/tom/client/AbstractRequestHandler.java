@@ -53,6 +53,8 @@ public abstract class AbstractRequestHandler {
 
 	public abstract TOMMessage createRequest(byte[] request);
 
+    public abstract TOMMessage createInjection(byte[] request);
+
 	public void waitForResponse() throws InterruptedException {
 		if (!semaphore.tryAcquire(timeout, TimeUnit.SECONDS)) {
 			requestTimeout = true;
