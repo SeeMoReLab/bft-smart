@@ -35,16 +35,16 @@ for ((i=0; i<NUM_REPLICAS; i++)); do
   echo "Starting replica $i..."
   osascript <<EOF
 tell application "Terminal"
-    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.benchmark.ThroughputLatencyServer $i 64"
+    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.demo.smallbank.SmallBankServer $i"
 end tell
 EOF
 done
 
 REPLICA_DIR="$(cd "$PROJECT_DIR/replica0" && pwd)"
-sleep 5s
+sleep 7s
 osascript <<EOF
 tell application "Terminal"
-    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.benchmark.ThroughputLatencyClient 0 1 1000 32 true true true"
+    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.demo.smallbank.SmallBankClient -c config/smallbank_config.xml --create --execute --inject"
 end tell
 EOF
 

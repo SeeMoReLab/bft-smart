@@ -293,12 +293,11 @@ public class ServersCommunicationLayer extends Thread {
 	}
 
     private int getDelayFromInjection(int target, SystemMessage sm) {
-        int type = 0;
+        int type;
         int delay = 0;
         if (sm instanceof ConsensusMessage) {
             ConsensusMessage msg = (ConsensusMessage) sm;
             type = msg.getType();
-            System.out.println("Consensus message received: " + type);
         } else if (sm instanceof LCMessage) {
             LCMessage msg = (LCMessage) sm;
             type = msg.getType();

@@ -1,6 +1,5 @@
-package bftsmart.benchmark;
+package bftsmart.injection;
 
-import bftsmart.injection.*;
 import bftsmart.tom.ServiceProxy;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;

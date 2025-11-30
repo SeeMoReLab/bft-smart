@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<parameters>
+
+    <!-- SmallBank Configuration -->
+    <numAccounts>10</numAccounts>
+
+    <!-- Number of concurrent client threads -->
+    <terminals>2</terminals>
+
+    <!-- Random seed for reproducibility -->
+    <randomSeed>17</randomSeed>
+
+    <!-- Workload Phases -->
+    <works>
+        <work>
+            <!-- Duration in seconds -->
+            <time>5</time>
+
+            <!-- Target transactions per second PER TERMINAL -->
+            <!-- Total TPS = rate * terminals -->
+            <rate>1</rate>
+
+            <!-- Transaction mix weights (must sum to 100) -->
+            <!-- Order: DepositChecking, TransactSavings, WriteCheck, SendPayment, Amalgamate, Balance -->
+            <weights>15,15,25,15,15,15</weights>
+        </work>
+    </works>
+
+</parameters>
