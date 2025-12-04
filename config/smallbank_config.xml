@@ -24,6 +24,11 @@
             <!-- Order: DepositChecking, TransactSavings, WriteCheck, SendPayment, Amalgamate, Balance -->
             <weights>15,15,25,15,15,15</weights>
         </work>
+        <work>
+            <time>5</time>
+            <rate>2</rate>
+            <weights>20,15,25,15,15,10</weights>
+        </work>
     </works>
 
 </parameters>

@@ -3,11 +3,13 @@ package bftsmart.demo.smallbank;
 import bftsmart.injection.InjectionClient;
 import bftsmart.tom.ServiceProxy;
 import org.apache.commons.cli.*;
+import org.apache.commons.configuration2.HierarchicalConfiguration;
 import org.apache.commons.configuration2.XMLConfiguration;
 import org.apache.commons.configuration2.builder.FileBasedConfigurationBuilder;
 import org.apache.commons.configuration2.builder.fluent.Parameters;
 import org.apache.commons.configuration2.convert.DisabledListDelimiterHandler;
 import org.apache.commons.configuration2.ex.ConfigurationException;
+import org.apache.commons.configuration2.tree.ImmutableNode;
 import org.apache.commons.configuration2.tree.xpath.XPathExpressionEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,10 +63,24 @@ public class SmallBankClient {
                 client.createAccounts();
             }
 
+            if (argsLine.hasOption("inject")) {
+                try {
+                    ExecutorService injectionExecutor = Executors.newFixedThreadPool(1);
+                    InjectionClient injectionClient = new InjectionClient(
+                            "config/injection.json", config.terminals);
+                    injectionExecutor.submit(injectionClient::start);
+                } catch (Exception ex) {
+                    System.out.println("Could not load injection config " + ex.getMessage());
+                }
+            }
+
             if (argsLine.hasOption("execute")) {
                 System.out.println("Executing workload...");
-                boolean shouldInject = argsLine.hasOption("inject");
-                client.executeWorkload(shouldInject);
+
+                for (int i = 0; i < config.phases.length; i++) {
+                    client.executeWorkload(i);
+                }
+
             }
 
             client.close();
@@ -117,32 +133,17 @@ public class SmallBankClient {
         System.out.printf("Finished creating %d accounts in %d ms%n", config.numAccounts, duration);
     }
 
-    private void executeWorkload(boolean shouldInject) {
+    private void executeWorkload(int phaseNum) {
         ExecutorService executor = Executors.newFixedThreadPool(config.terminals + 1);
         CountDownLatch startLatch = new CountDownLatch(1);
         CountDownLatch completionLatch = new CountDownLatch(config.terminals);
 
-        System.out.printf("Starting %d terminals for %d seconds%n", config.terminals, config.duration);
-        System.out.printf("Target rate: %.2f TPS per terminal%n", config.rate);
-        System.out.println("Transaction weights: " + Arrays.toString(config.weights));
+        // If number of terminals in phase is -1, default to parent level
+        int terminals = (config.phases[phaseNum].terminals == -1)? config.terminals: config.phases[phaseNum].terminals;
 
-        if (shouldInject) {
-            try {
-                InjectionClient injectionClient = new InjectionClient(
-                        "config/injection.json", config.terminals);
-                executor.submit(() -> {
-                    try {
-                        startLatch.await();
-                        injectionClient.start();
-                    } catch (InterruptedException ex) {
-                        System.out.println("Exception while starting injection client: " + ex);
-                    }
-                });
-            } catch (Exception ex) {
-                System.out.println("Could not load injection config " + ex.getMessage());
-            }
-
-        }
+        System.out.printf("Starting %d terminals for %d seconds%n", terminals, config.phases[phaseNum].duration);
+        System.out.printf("Target rate: %.2f TPS per terminal%n", config.phases[phaseNum].rate);
+        System.out.println("Transaction weights: " + Arrays.toString(config.phases[phaseNum].weights));
 
         // Create worker threads
         for (int i = 0; i < config.terminals; i++) {
@@ -150,7 +151,7 @@ public class SmallBankClient {
             executor.submit(() -> {
                 try {
                     startLatch.await(); // Wait for all threads to be ready
-                    runTerminal(terminalId);
+                    runTerminal(terminalId, phaseNum);
                 } catch (Exception e) {
                     System.out.println("Error in terminal" + terminalId + ": " + e);
                 } finally {
@@ -166,7 +167,7 @@ public class SmallBankClient {
 
         // Wait for duration
         try {
-            completionLatch.await(config.duration + 10, TimeUnit.SECONDS);
+            completionLatch.await(config.phases[phaseNum].duration + 10, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             LOG.error("Interrupted while waiting for completion", e);
         }
@@ -175,16 +176,16 @@ public class SmallBankClient {
         long workloadEnd = System.nanoTime();
 
         // Print results
-        printResults(workloadStart, workloadEnd);
+        printResults(phaseNum, workloadStart, workloadEnd);
     }
 
-    private void runTerminal(int terminalId) {
+    private void runTerminal(int terminalId, int phaseNum) {
         Random terminalRandom = new Random(config.randomSeed + terminalId);
         long startTime = System.nanoTime();
-        long endTime = startTime + TimeUnit.SECONDS.toNanos(config.duration);
+        long endTime = startTime + TimeUnit.SECONDS.toNanos(config.phases[phaseNum].duration);
 
         // Calculate interval between transactions for rate limiting
-        long intervalNs = (long) (1_000_000_000.0 / config.rate);
+        long intervalNs = (long) (1_000_000_000.0 / config.phases[phaseNum].rate);
         long nextTransactionTime = startTime;
 
         int txCount = 0;
@@ -202,7 +203,7 @@ public class SmallBankClient {
             }
 
             // Execute transaction
-            SmallBankMessage.TransactionType txType = selectTransactionType(terminalRandom);
+            SmallBankMessage.TransactionType txType = selectTransactionType(terminalRandom, config.phases[phaseNum].weights);
             long txStart = System.nanoTime();
             boolean success = executeTransaction(txType, terminalRandom);
             long txEnd = System.nanoTime();
@@ -229,17 +230,17 @@ public class SmallBankClient {
         System.out.printf("Terminal %d completed %d transactions", terminalId, txCount);
     }
 
-    private SmallBankMessage.TransactionType selectTransactionType(Random rnd) {
+    private SmallBankMessage.TransactionType selectTransactionType(Random rnd, int[] weights) {
         int totalWeight = 0;
-        for (int weight : config.weights) {
+        for (int weight : weights) {
             totalWeight += weight;
         }
 
         int randomValue = rnd.nextInt(totalWeight);
         int cumulativeWeight = 0;
 
-        for (int i = 0; i < config.weights.length; i++) {
-            cumulativeWeight += config.weights[i];
+        for (int i = 0; i < weights.length; i++) {
+            cumulativeWeight += weights[i];
             if (randomValue < cumulativeWeight) {
                 return SmallBankMessage.TransactionType.values()[i];
             }
@@ -295,7 +296,7 @@ public class SmallBankClient {
         }
     }
 
-    private void printResults(long startNs, long endNs) {
+    private void printResults(int phaseNum, long startNs, long endNs) {
         double durationSeconds = (endNs - startNs) / 1_000_000_000.0;
         int totalTxns = successCount.get() + errorCount.get();
         double throughput = totalTxns / durationSeconds;
@@ -307,6 +308,8 @@ public class SmallBankClient {
         long p95 = getPercentile(latencies, 0.95);
         long p99 = getPercentile(latencies, 0.99);
 
+        System.out.println(SINGLE_LINE);
+        System.out.printf("Phase %d results", phaseNum);
         System.out.println(SINGLE_LINE);
         System.out.println("Workload Results:");
         System.out.printf("Duration: %.2f seconds%n", durationSeconds);
@@ -339,24 +342,41 @@ public class SmallBankClient {
         config.numAccounts = xml.getInt("numAccounts", 100000);
         config.terminals = xml.getInt("terminals", 1);
         config.randomSeed = xml.getInt("randomSeed", 17);
+        int size = xml.configurationsAt("/works/work").size();
+        config.phases = new Phase[size];
+        for (int i = 1; i < size + 1; i++) {
+            final HierarchicalConfiguration<ImmutableNode> work =
+                    xml.configurationAt("works/work[" + i + "]");
+            Phase phase = new Phase();
+            phase.terminals = work.getInt("terminals", -1);
+            phase.duration = work.getInt("time");
+            phase.rate = work.getDouble("rate");
 
-        // Parse work configuration
-        config.duration = xml.getInt("works/work/time", 60);
-        config.rate = xml.getDouble("works/work/rate", 100.0);
+            String weightsStr = work.getString("weights", "15,15,15,25,15,15");
+            String[] weightParts = weightsStr.split(",");
+            phase.weights = new int[weightParts.length];
+            int weightsSum = 0;
+            for (int j = 0; j < weightParts.length; j++) {
+                phase.weights[j] = Integer.parseInt(weightParts[j].trim());
+                weightsSum += phase.weights[j];
+            }
 
-        String weightsStr = xml.getString("works/work/weights", "15,15,15,25,15,15");
-        String[] weightParts = weightsStr.split(",");
-        config.weights = new int[weightParts.length];
-        for (int i = 0; i < weightParts.length; i++) {
-            config.weights[i] = Integer.parseInt(weightParts[i].trim());
+            if (weightsSum != 100) {
+                throw new ConfigurationException("Bad weights for phase " + i + "with sum: " + weightsSum);
+            }
+
+            config.phases[i - 1] = phase;
         }
 
         System.out.println("Configuration loaded:");
         System.out.printf("Accounts: %d%n", config.numAccounts);
-        System.out.printf("Terminals: %d%n}", config.terminals);
-        System.out.printf("Duration: %d seconds%n", config.duration);
-        System.out.printf("Rate: %.2f TPS/terminal%n", config.rate);
-        System.out.println("Weights: " + Arrays.toString(config.weights));
+        System.out.printf("Terminals: %d%n", config.terminals);
+        for (int i = 0; i < config.phases.length; i++) {
+            System.out.printf("Phase %d:%n", i+1);
+            System.out.printf("Duration: %d seconds%n", config.phases[i].duration);
+            System.out.printf("Rate: %.2f TPS/terminal%n", config.phases[i].rate);
+            System.out.println("Weights: " + Arrays.toString(config.phases[i].weights));
+        }
 
         return config;
     }
@@ -392,6 +412,14 @@ public class SmallBankClient {
         int numAccounts;
         int terminals;
         int randomSeed;
+//        int duration;
+//        double rate;
+//        int[] weights;
+        Phase[] phases;
+    }
+
+    private static class Phase {
+        int terminals;
         int duration;
         double rate;
         int[] weights;
