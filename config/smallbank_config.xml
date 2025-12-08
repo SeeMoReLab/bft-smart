@@ -2,19 +2,22 @@
 <parameters>
 
     <!-- SmallBank Configuration -->
-    <numAccounts>10</numAccounts>
-
-    <!-- Number of concurrent client threads -->
-    <terminals>2</terminals>
+    <numAccounts>1000</numAccounts>
 
     <!-- Random seed for reproducibility -->
     <randomSeed>17</randomSeed>
+
+    <!-- Monitoring interval in seconds (0 disables periodic monitor output) -->
+    <monitorInterval>1</monitorInterval>
 
     <!-- Workload Phases -->
     <works>
         <work>
             <!-- Duration in seconds -->
             <time>5</time>
+
+            <!-- Number of terminals active in this phase -->
+            <terminals>5</terminals>
 
             <!-- Target transactions per second PER TERMINAL -->
             <!-- Total TPS = rate * terminals -->
@@ -26,7 +29,14 @@
         </work>
         <work>
             <time>5</time>
+            <terminals>8</terminals>
             <rate>2</rate>
+            <weights>20,15,25,15,15,10</weights>
+        </work>
+        <work>
+            <time>10</time>
+            <terminals>10</terminals>
+            <rate>100</rate>
             <weights>20,15,25,15,15,10</weights>
         </work>
     </works>
