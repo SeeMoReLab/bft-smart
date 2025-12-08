@@ -2,6 +2,8 @@ package bftsmart.demo.smallbank;
 
 import bftsmart.injection.InjectionClient;
 import bftsmart.tom.ServiceProxy;
+import bftsmart.demo.util.Histogram;
+import bftsmart.demo.util.RandomDistribution;
 import org.apache.commons.cli.*;
 import org.apache.commons.configuration2.HierarchicalConfiguration;
 import org.apache.commons.configuration2.XMLConfiguration;
@@ -28,14 +30,14 @@ public class SmallBankClient {
     private final Logger logger = LoggerFactory.getLogger(SmallBankClient.class);
 
     private static final String SINGLE_LINE = "======================================================================";
+    private static final int MAX_LATENCY_MS = 10_000; // bucket upper bound; overflow latencies are clamped
 
     private final ServiceProxy proxy;
     private final WorkloadConfig config;
-    private final Random random;
     private final AtomicInteger successCount = new AtomicInteger(0);
     private final AtomicInteger errorCount = new AtomicInteger(0);
     private final AtomicLong totalLatency = new AtomicLong(0);
-    private final List<Long> latencies = new CopyOnWriteArrayList<>();
+    private final Histogram<Long> latencyHistogram = new Histogram<>();
 
     public static void main(String[] args) {
         try {
@@ -97,7 +99,6 @@ public class SmallBankClient {
 
     public SmallBankClient(int clientId, WorkloadConfig config) {
         this.config = config;
-        this.random = new Random(config.randomSeed + clientId);
         this.proxy = new ServiceProxy(clientId);
         System.out.printf("Client %d initialized%n", clientId);
     }
@@ -135,6 +136,7 @@ public class SmallBankClient {
     }
 
     private void executeWorkload(int phaseNum) {
+        resetMetrics();
         ExecutorService executor = Executors.newFixedThreadPool(config.terminals + 1);
         CountDownLatch startLatch = new CountDownLatch(1);
         CountDownLatch completionLatch = new CountDownLatch(config.terminals);
@@ -182,7 +184,10 @@ public class SmallBankClient {
     }
 
     private void runTerminal(int terminalId, int phaseNum) {
-        Random terminalRandom = new Random(config.randomSeed + terminalId);
+        long seed = computeTerminalSeed(terminalId, phaseNum);
+        Random terminalRandom = new Random(seed);
+        RandomDistribution.Flat accountRng = new RandomDistribution.Flat(new Random(seed ^ 0x9E3779B97F4A7C15L),
+                0, config.numAccounts);
         long startTime = System.nanoTime();
         long endTime = startTime + TimeUnit.SECONDS.toNanos(config.phases[phaseNum].duration);
 
@@ -208,7 +213,7 @@ public class SmallBankClient {
             SmallBankMessage.TransactionType txType = selectTransactionType(terminalRandom,
                     config.phases[phaseNum].weights);
             long txStart = System.nanoTime();
-            boolean success = executeTransaction(txType, terminalRandom);
+            boolean success = executeTransaction(txType, terminalRandom, accountRng);
             long txEnd = System.nanoTime();
 
             // Record results
@@ -216,7 +221,7 @@ public class SmallBankClient {
                 successCount.incrementAndGet();
                 long latency = txEnd - txStart;
                 totalLatency.addAndGet(latency);
-                latencies.add(latency / 1_000_000); // Convert to ms
+                recordLatency(latency);
             } else {
                 errorCount.incrementAndGet();
             }
@@ -252,13 +257,14 @@ public class SmallBankClient {
         return SmallBankMessage.TransactionType.WRITE_CHECK; // Default
     }
 
-    private boolean executeTransaction(SmallBankMessage.TransactionType type, Random rnd) {
+    private boolean executeTransaction(SmallBankMessage.TransactionType type, Random rnd,
+            RandomDistribution.Flat accountRng) {
         try {
             SmallBankMessage msg = null;
-            long custId1 = rnd.nextInt(config.numAccounts);
-            long custId2 = rnd.nextInt(config.numAccounts);
+            long custId1 = accountRng.nextLong();
+            long custId2 = accountRng.nextLong();
             while (custId2 == custId1) {
-                custId2 = rnd.nextInt(config.numAccounts);
+                custId2 = accountRng.nextLong();
             }
             double amount = 1.0 + rnd.nextDouble() * 99.0; // 1-100
             logger.debug("Executing Type {}", type.toString());
@@ -303,13 +309,12 @@ public class SmallBankClient {
         double durationSeconds = (endNs - startNs) / 1_000_000_000.0;
         int totalTxns = successCount.get() + errorCount.get();
         double throughput = totalTxns / durationSeconds;
-        double avgLatency = totalLatency.get() / 1_000_000.0 / successCount.get();
+        int successes = successCount.get();
+        double avgLatency = successes == 0 ? 0 : totalLatency.get() / 1_000_000.0 / successes;
 
-        // Calculate percentiles
-        Collections.sort(latencies);
-        long p50 = getPercentile(latencies, 0.50);
-        long p95 = getPercentile(latencies, 0.95);
-        long p99 = getPercentile(latencies, 0.99);
+        long p50 = getPercentileFromHistogram(0.50);
+        long p95 = getPercentileFromHistogram(0.95);
+        long p99 = getPercentileFromHistogram(0.99);
 
         measurementLogger.info(SINGLE_LINE);
         measurementLogger.info("Phase {} results:", phaseNum);
@@ -320,12 +325,42 @@ public class SmallBankClient {
         measurementLogger.info(SINGLE_LINE);
     }
 
-    private long getPercentile(List<Long> sortedValues, double percentile) {
-        if (sortedValues.isEmpty())
+    private long getPercentileFromHistogram(double percentile) {
+        int successes = successCount.get();
+        if (successes == 0) {
             return 0;
-        int index = (int) Math.ceil(percentile * sortedValues.size()) - 1;
-        index = Math.max(0, Math.min(index, sortedValues.size() - 1));
-        return sortedValues.get(index);
+        }
+
+        long target = (long) Math.ceil(percentile * successes);
+        long cumulative = 0;
+        for (Long bucket : latencyHistogram.values()) {
+            Integer count = latencyHistogram.get(bucket);
+            if (count == null) {
+                continue;
+            }
+            cumulative += count;
+            if (cumulative >= target) {
+                return bucket;
+            }
+        }
+        return MAX_LATENCY_MS;
+    }
+
+    private void recordLatency(long latencyNs) {
+        long latencyMs = TimeUnit.NANOSECONDS.toMillis(latencyNs);
+        long bucket = Math.min(latencyMs, MAX_LATENCY_MS);
+        latencyHistogram.put(bucket);
+    }
+
+    private void resetMetrics() {
+        successCount.set(0);
+        errorCount.set(0);
+        totalLatency.set(0);
+        latencyHistogram.clear();
+    }
+
+    private long computeTerminalSeed(int terminalId, int phaseNum) {
+        return ((long) config.randomSeed * 31 + terminalId * 17L) ^ (phaseNum * 1_003L);
     }
 
     private void close() {
