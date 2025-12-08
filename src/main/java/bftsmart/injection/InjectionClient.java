@@ -1,6 +1,5 @@
-package bftsmart.benchmark;
+package bftsmart.injection;
 
-import bftsmart.injection.*;
 import bftsmart.tom.ServiceProxy;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -40,14 +39,19 @@ public class InjectionClient {
         }
 
         // Schedule each config based on its time
+        long lastInjectionTime = 0;
         for (InjectionConfig config : configs) {
             long delaySeconds = config.getTime();
             scheduler.schedule(() -> {
                 inject(config);
             }, delaySeconds, TimeUnit.SECONDS);
-
+            lastInjectionTime = Math.max(delaySeconds, lastInjectionTime);
             logger.info("Scheduled injection config to apply at {} seconds", delaySeconds);
         }
+
+        final long shutdownDelay = lastInjectionTime + 5;
+        scheduler.schedule(this::shutdown,  shutdownDelay, TimeUnit.SECONDS);
+        logger.info("Scheduled injector shutdown at {} seconds", shutdownDelay);
     }
 
     /**

@@ -336,7 +336,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
     public void requestReceived(TOMMessage msg, boolean fromClient) {
 
         if (!doWork) return;
-        System.out.println("MSG TYPE: " + msg.getReqType() + msg.isInjection());
         switch(msg.getReqType()) {
 		case ASK_STATUS:
 		case REPLY:
