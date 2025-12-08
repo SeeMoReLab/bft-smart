@@ -16,8 +16,12 @@
 package bftsmart.communication.server;
 
 import bftsmart.communication.SystemMessage;
+import bftsmart.consensus.messages.ConsensusMessage;
+import bftsmart.injection.DelayBounds;
+import bftsmart.injection.Injection;
 import bftsmart.reconfiguration.ServerViewController;
 import bftsmart.tom.ServiceReplica;
+import bftsmart.tom.leaderchange.LCMessage;
 import bftsmart.tom.util.TOMUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,7 +36,7 @@ import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.security.Security;
 import java.util.*;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -75,6 +79,19 @@ public class ServersCommunicationLayer extends Thread {
 	private static final String SECRET = "MySeCreT_2hMOygBwY";
 	private final SecretKey selfPwd;
 	private final SSLServerSocket serverSocketSSLTLS;
+
+    // Adaptive Timers
+    // Injection object to hold failure injection data
+    private Injection injection;
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+    public void setInjection(Injection injection) {
+        this.injection = injection;
+    }
+
+    public Injection getInjection() {
+        return injection;
+    }
 
 	public ServersCommunicationLayer(ServerViewController controller,
 									 LinkedBlockingQueue<SystemMessage> inQueue,
@@ -162,6 +179,8 @@ public class ServersCommunicationLayer extends Thread {
 			}
 		}
 
+        injection = new Injection();
+
 		start();
 	}
 
@@ -229,6 +248,17 @@ public class ServersCommunicationLayer extends Thread {
 
 		byte[] data = bOut.toByteArray();
 
+        // Adaptive Timers
+        // Filter targets to remove ignored nodes
+        ArrayList<Integer> filteredTargets = new ArrayList<>();
+        for (int target : targets) {
+            boolean isIgnored = injection.getIgnoreNodes().getOrDefault(target, false);
+            if (!isIgnored) {
+                filteredTargets.add(target);
+            }
+        }
+        targets = filteredTargets.stream().mapToInt(i -> i).toArray();
+
 		// this shuffling is done to prevent the replica with the lowest ID/index  from being always
 		// the last one receiving the messages, which can result in that replica  to become consistently
 		// delayed in relation to the others.
@@ -243,8 +273,18 @@ public class ServersCommunicationLayer extends Thread {
 					inQueue.put(sm);
 					logger.debug("Queueing (delivering) my own message, me:{}", target);
 				} else {
-					logger.debug("Sending message from:{} -> to:{}.", me,  target);
-					getConnection(target).send(data);
+                    // Schedule the send operation with a delay
+                    long delayMillis = getDelayFromInjection(target, sm);
+                    logger.info("Sending message from:{} -> to:{} with delay: {}ms.", me,  target, delayMillis);
+                    final int finalTarget = target;
+                    scheduler.schedule(() -> {
+                        try {
+                            getConnection(finalTarget).send(data);
+                        } catch (Exception e) {
+                            logger.error("Failed to send delayed message to " + finalTarget, e);
+                        }
+                    }, delayMillis, TimeUnit.MILLISECONDS);
+//					getConnection(target).send(data);
 				}
 			} catch (InterruptedException ex) {
 				logger.error("Interruption while inserting message into inqueue", ex);
@@ -252,12 +292,38 @@ public class ServersCommunicationLayer extends Thread {
 		}
 	}
 
+    private int getDelayFromInjection(int target, SystemMessage sm) {
+        int type = 0;
+        int delay = 0;
+        if (sm instanceof ConsensusMessage) {
+            ConsensusMessage msg = (ConsensusMessage) sm;
+            type = msg.getType();
+            System.out.println("Consensus message received: " + type);
+        } else if (sm instanceof LCMessage) {
+            LCMessage msg = (LCMessage) sm;
+            type = msg.getType();
+        } else {
+            return delay;
+        }
+
+        HashMap<Integer, DelayBounds> delayBoundsMap = injection.getDelays().get(type);
+        if (delayBoundsMap != null) {
+            DelayBounds delayBounds = delayBoundsMap.get(target);
+            if (delayBounds != null) {
+                int minDelay = delayBounds.getMinDelay();
+                int maxDelay = delayBounds.getMaxDelay();
+                delay = ThreadLocalRandom.current().nextInt(minDelay, maxDelay + 1);
+            }
+        }
+        return delay;
+    }
+
 	public void shutdown() {
 
 		logger.info("Shutting down replica sockets");
 
 		doWork = false;
-
+        scheduler.shutdown();
 		//******* EDUARDO BEGIN **************//
 		int[] activeServers = controller.getCurrentViewAcceptors();
 

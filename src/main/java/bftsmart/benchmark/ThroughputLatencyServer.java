@@ -52,23 +52,23 @@ public class ThroughputLatencyServer extends DefaultSingleRecoverable {
 	public byte[] appExecuteOrdered(byte[] command, MessageContext msgCtx) {
 		iterations++;
 		consensusLatency.store(msgCtx.getFirstInBatch().decisionTime - msgCtx.getFirstInBatch().consensusStartTime);
-		if (iterations % interval == 0) {
-			if (this.replica.getLearningAgentClient() != null) {
-                Prediction prediction = this.replica.getLearningAgentClient()
-                    .predict(
-                        interval,
-                        (float) consensusLatency.getAverage(false) / 1000000,
-                        (float) consensusLatency.getMax(false) / 1000000,
-                        (float) consensusLatency.getMin(false) / 1000000,
-                        (float) consensusLatency.getDP(false) / 1000000
-                    );
-                System.out.println("Prediction ID: " + prediction.getPredictionId());
-                System.out.println("Suggested timeout: " + 
-                        prediction.getAction().getTimeoutMilliseconds() + " ms");
-                replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
-            }
-			iterations = 0;
-		}
+//		if (iterations % interval == 0) {
+//			if (this.replica.getLearningAgentClient() != null) {
+//                Prediction prediction = this.replica.getLearningAgentClient()
+//                    .predict(
+//                        interval,
+//                        (float) consensusLatency.getAverage(false) / 1000000,
+//                        (float) consensusLatency.getMax(false) / 1000000,
+//                        (float) consensusLatency.getMin(false) / 1000000,
+//                        (float) consensusLatency.getDP(false) / 1000000
+//                    );
+//                System.out.println("Prediction ID: " + prediction.getPredictionId());
+//                System.out.println("Suggested timeout: " +
+//                        prediction.getAction().getTimeoutMilliseconds() + " ms");
+//                replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
+//            }
+//			iterations = 0;
+//		}
 		return processRequest(msgCtx);
 	}
 

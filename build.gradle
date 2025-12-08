@@ -202,6 +202,9 @@ dependencies {
 	implementation "io.grpc:grpc-stub:${grpcVersion}"
 	compileOnly "org.apache.tomcat:annotations-api:6.0.53"
 	implementation "com.google.protobuf:protobuf-java:${protobufVersion}"
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
+    implementation 'com.fasterxml.jackson.core:jackson-core:2.15.2'
+    implementation 'com.fasterxml.jackson.core:jackson-annotations:2.15.2'
 }
 
 protobuf {

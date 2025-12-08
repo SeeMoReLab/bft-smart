@@ -105,7 +105,7 @@ public class ServerCommunicationSystem extends Thread {
     public void run() {
         
         long count = 0;
-        while (doWork) {
+        while (doWork && serversConn.getInjection().isNodeAlive()) {
             try {
                 if (count % 1000 == 0 && count > 0) {
                     logger.debug("After " + count + " messages, inQueue size=" + inQueue.size());
@@ -114,9 +114,16 @@ public class ServerCommunicationSystem extends Thread {
                 SystemMessage sm = inQueue.poll(MESSAGE_WAIT_TIME, TimeUnit.MILLISECONDS);
 
                 if (sm != null) {
-                    logger.debug("<-- receiving, msg:" + sm);
-                    messageHandler.processData(sm);
-                    count++;
+                    // Adaptive Timers
+                    // Check if message is from an in dark node
+                    if (!isNodeIgnored(sm.getSender())) {
+                        logger.debug("<-- receiving, msg:" + sm);
+                        messageHandler.processData(sm);
+                        count++;
+                    } else {
+                        logger.debug("XXX ignoring msg from: " + sm.getSender() + ", msg:" + sm);
+                    }
+
                 } else {                
                     messageHandler.verifyPending();               
                 }
@@ -127,6 +134,10 @@ public class ServerCommunicationSystem extends Thread {
         }
         logger.info("ServerCommunicationSystem stopped.");
 
+    }
+
+    private boolean isNodeIgnored(int sender) {
+        return serversConn.getInjection().getIgnoreNodes().getOrDefault(sender, false);
     }
 
     /**

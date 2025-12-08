@@ -88,6 +88,12 @@ public class TOMMessage extends SystemMessage implements Externalizable, Compara
 
 	private int replyServer = -1;
 
+    //Adaptive Timers
+    private boolean isInjection = false;
+    public boolean isInjection() {
+        return isInjection;
+    }
+
 	public TOMMessage() {
 	}
 
@@ -126,6 +132,14 @@ public class TOMMessage extends SystemMessage implements Externalizable, Compara
 		this.content = content;
 		this.type = type;
 	}
+
+    // Adaptive Timers
+    // Constructor chaining for injection messages
+    public TOMMessage(int sender, int session, int sequence, int operationId, byte[] content, int view, TOMMessageType type, boolean isInjection) {
+        this(sender, session, sequence, operationId, content, view, type);
+        this.isInjection = isInjection;
+        System.out.println("Setting injection: " + this.isInjection);
+    }
 
 
 	/** THIS IS JOAO'S CODE, FOR DEBUGGING */
@@ -236,6 +250,7 @@ public class TOMMessage extends SystemMessage implements Externalizable, Compara
 		out.writeInt(sequence);
 		out.writeInt(operationId);
 		out.writeInt(replyServer);
+        out.writeBoolean(isInjection);
 		
 		if (content == null) {
 			out.writeInt(-1);
@@ -253,6 +268,7 @@ public class TOMMessage extends SystemMessage implements Externalizable, Compara
 		sequence = in.readInt();
 		operationId = in.readInt();
 		replyServer = in.readInt();
+        isInjection = in.readBoolean();
 		
 		int toRead = in.readInt();
 		if (toRead != -1) {
@@ -378,7 +394,7 @@ public class TOMMessage extends SystemMessage implements Externalizable, Compara
                     clone.timestamp = this.timestamp;
                     clone.writeSentTime = this.writeSentTime;
                     clone.retry = this.retry;
-
+                    clone.isInjection = this.isInjection;
                     return clone;
                         
 		}

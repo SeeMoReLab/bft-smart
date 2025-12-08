@@ -23,6 +23,11 @@ public class NormalRequestHandler extends AbstractRequestHandler {
 		return new TOMMessage(me, session, sequenceId, operationId, request, viewId, requestType);
 	}
 
+    @Override
+    public TOMMessage createInjection(byte[] request) {
+        return new TOMMessage(me, session, sequenceId, operationId, request, viewId, requestType, true);
+    }
+
 	@Override
 	public TOMMessage processReply(TOMMessage reply, int lastSenderIndex) {
 		//optimization - compare responses after having a quorum of replies

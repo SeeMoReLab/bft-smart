@@ -41,10 +41,10 @@ EOF
 done
 
 REPLICA_DIR="$(cd "$PROJECT_DIR/replica0" && pwd)"
-sleep 2s
+sleep 5s
 osascript <<EOF
 tell application "Terminal"
-    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.benchmark.ThroughputLatencyClient 0 10 1000 32 true true true"
+    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.benchmark.ThroughputLatencyClient 0 1 1000 32 true true true"
 end tell
 EOF
 
