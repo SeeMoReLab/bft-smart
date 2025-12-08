@@ -40,11 +40,13 @@ end tell
 EOF
 done
 
+mkdir -p "$PROJECT_DIR/output"
+
 REPLICA_DIR="$(cd "$PROJECT_DIR/replica0" && pwd)"
 sleep 7s
 osascript <<EOF
 tell application "Terminal"
-    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.demo.smallbank.SmallBankClient -c config/smallbank_config.xml --create --execute"
+    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.demo.smallbank.SmallBankClient -c config/smallbank_config.xml --create --execute > ../output/out.txt"
 end tell
 EOF
 

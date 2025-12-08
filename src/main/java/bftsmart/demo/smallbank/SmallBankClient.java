@@ -24,7 +24,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * Reads configuration from XML and executes workload with rate limiting
  */
 public class SmallBankClient {
-    private static final Logger LOG = LoggerFactory.getLogger(SmallBankClient.class);
+    private final Logger measurementLogger = LoggerFactory.getLogger("measurement");
+    private final Logger logger = LoggerFactory.getLogger(SmallBankClient.class);
+
     private static final String SINGLE_LINE = "======================================================================";
 
     private final ServiceProxy proxy;
@@ -88,7 +90,7 @@ public class SmallBankClient {
             System.out.println("Client finished");
 
         } catch (Exception e) {
-            LOG.error("Error in client execution", e);
+            System.out.println("Error in client execution" + e.getMessage());
             System.exit(1);
         }
     }
@@ -101,7 +103,7 @@ public class SmallBankClient {
     }
 
     private void createAccounts() {
-        System.out.printf("Creating %d accounts...%n", config.numAccounts);
+        logger.info("Creating {} accounts...", config.numAccounts);
         long startTime = System.currentTimeMillis();
 
         for (long custId = 0; custId < config.numAccounts; custId++) {
@@ -110,27 +112,26 @@ public class SmallBankClient {
             double checkingBalance = 10000.0;
 
             SmallBankMessage msg = SmallBankMessage.newCreateAccountRequest(
-                    custId, custName, savingsBalance, checkingBalance
-            );
+                    custId, custName, savingsBalance, checkingBalance);
 
             try {
                 byte[] reply = proxy.invokeOrdered(msg.getBytes());
                 SmallBankMessage response = SmallBankMessage.getObject(reply);
 
                 if (response.getResult() != 0) {
-                    System.out.println("Failed to create account " +  custId + ": " + response.getErrorMsg());
+                    logger.error("Failed to create account {}: {}", custId, response.getErrorMsg());
                 }
             } catch (Exception e) {
-                System.out.println("Error creating account " +  custId + ": " + e);
+                logger.error("Error creating account {}", custId, e);
             }
 
             if ((custId + 1) % 1000 == 0) {
-                System.out.printf("Created %d accounts%n", custId + 1);
+                logger.info("Created {} accounts", custId + 1);
             }
         }
 
         long duration = System.currentTimeMillis() - startTime;
-        System.out.printf("Finished creating %d accounts in %d ms%n", config.numAccounts, duration);
+        logger.info("Finished creating {} accounts in {} ms", config.numAccounts, duration);
     }
 
     private void executeWorkload(int phaseNum) {
@@ -139,11 +140,12 @@ public class SmallBankClient {
         CountDownLatch completionLatch = new CountDownLatch(config.terminals);
 
         // If number of terminals in phase is -1, default to parent level
-        int terminals = (config.phases[phaseNum].terminals == -1)? config.terminals: config.phases[phaseNum].terminals;
+        int terminals = (config.phases[phaseNum].terminals == -1) ? config.terminals
+                : config.phases[phaseNum].terminals;
 
-        System.out.printf("Starting %d terminals for %d seconds%n", terminals, config.phases[phaseNum].duration);
-        System.out.printf("Target rate: %.2f TPS per terminal%n", config.phases[phaseNum].rate);
-        System.out.println("Transaction weights: " + Arrays.toString(config.phases[phaseNum].weights));
+        logger.info("Starting {} terminals for {} seconds", terminals, config.phases[phaseNum].duration);
+        logger.info("Target rate: {} TPS per terminal", config.phases[phaseNum].rate);
+        logger.info("Transaction weights: {}", Arrays.toString(config.phases[phaseNum].weights));
 
         // Create worker threads
         for (int i = 0; i < config.terminals; i++) {
@@ -153,7 +155,7 @@ public class SmallBankClient {
                     startLatch.await(); // Wait for all threads to be ready
                     runTerminal(terminalId, phaseNum);
                 } catch (Exception e) {
-                    System.out.println("Error in terminal" + terminalId + ": " + e);
+                    logger.error("Error in terminal {}", terminalId, e);
                 } finally {
                     completionLatch.countDown();
                 }
@@ -161,7 +163,7 @@ public class SmallBankClient {
         }
 
         // Start all terminals simultaneously
-        System.out.println("All terminals ready. Starting workload...");
+        // System.out.println("All terminals ready. Starting workload...");
         long workloadStart = System.nanoTime();
         startLatch.countDown();
 
@@ -169,7 +171,7 @@ public class SmallBankClient {
         try {
             completionLatch.await(config.phases[phaseNum].duration + 10, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
-            LOG.error("Interrupted while waiting for completion", e);
+            logger.error("Interrupted while waiting for completion", e);
         }
 
         executor.shutdownNow();
@@ -203,7 +205,8 @@ public class SmallBankClient {
             }
 
             // Execute transaction
-            SmallBankMessage.TransactionType txType = selectTransactionType(terminalRandom, config.phases[phaseNum].weights);
+            SmallBankMessage.TransactionType txType = selectTransactionType(terminalRandom,
+                    config.phases[phaseNum].weights);
             long txStart = System.nanoTime();
             boolean success = executeTransaction(txType, terminalRandom);
             long txEnd = System.nanoTime();
@@ -223,11 +226,11 @@ public class SmallBankClient {
 
             // Log progress periodically
             if (txCount % 100 == 0 && terminalId == 0) {
-                LOG.debug("Terminal {} executed {} transactions", terminalId, txCount);
+                logger.debug("Terminal {} executed {} transactions", terminalId, txCount);
             }
         }
 
-        System.out.printf("Terminal %d completed %d transactions", terminalId, txCount);
+        logger.info("Terminal {} completed {} transactions", terminalId, txCount);
     }
 
     private SmallBankMessage.TransactionType selectTransactionType(Random rnd, int[] weights) {
@@ -258,7 +261,7 @@ public class SmallBankClient {
                 custId2 = rnd.nextInt(config.numAccounts);
             }
             double amount = 1.0 + rnd.nextDouble() * 99.0; // 1-100
-            System.out.println("Executing Type " + type.toString());
+            logger.debug("Executing Type {}", type.toString());
             switch (type) {
                 case DEPOSIT_CHECKING:
                     msg = SmallBankMessage.newDepositCheckingRequest(custId1, amount);
@@ -268,7 +271,7 @@ public class SmallBankClient {
                     break;
                 case WRITE_CHECK:
                     msg = SmallBankMessage.newWriteCheckRequest(custId1, amount);
-                    System.out.println("Executing WriteCheck: " + msg);
+                    logger.debug("Executing WriteCheck: {}", msg);
                     break;
                 case SEND_PAYMENT:
                     msg = SmallBankMessage.newSendPaymentRequest(custId1, custId2, amount);
@@ -281,7 +284,7 @@ public class SmallBankClient {
                     msg = SmallBankMessage.newBalanceRequest(custId1);
                     byte[] reply = proxy.invokeUnordered(msg.getBytes());
                     SmallBankMessage response = SmallBankMessage.getObject(reply);
-                    System.out.println("Savings balance: " + response.getSavingsBalance());
+                    logger.debug("Savings balance: {}", response.getSavingsBalance());
                     return response.getResult() == 0;
             }
 
@@ -291,7 +294,7 @@ public class SmallBankClient {
             return response.getResult() == 0;
 
         } catch (Exception e) {
-            LOG.error("Error executing transaction {}", type, e);
+            logger.error("Error executing transaction {}", type, e);
             return false;
         }
     }
@@ -308,24 +311,18 @@ public class SmallBankClient {
         long p95 = getPercentile(latencies, 0.95);
         long p99 = getPercentile(latencies, 0.99);
 
-        System.out.println(SINGLE_LINE);
-        System.out.printf("Phase %d results", phaseNum);
-        System.out.println(SINGLE_LINE);
-        System.out.println("Workload Results:");
-        System.out.printf("Duration: %.2f seconds%n", durationSeconds);
-        System.out.printf("Total Transactions: %d%n", totalTxns);
-        System.out.printf("Successful: %d%n", successCount.get());
-        System.out.printf("Errors: %d%n", errorCount.get());
-        System.out.printf("Throughput: %.2f TPS%n", throughput);
-        System.out.printf("Average Latency: %.2f ms%n", avgLatency);
-        System.out.printf("P50 Latency: %d ms%n", p50);
-        System.out.printf("P95 Latency: %d ms%n", p95);
-        System.out.printf("P99 Latency: %d ms%n", p99);
-        System.out.println(SINGLE_LINE);
+        measurementLogger.info(SINGLE_LINE);
+        measurementLogger.info("Phase {} results:", phaseNum);
+        measurementLogger.info("duration: {} seconds, total trxs: {}, successful: {}, errors: {}", durationSeconds,
+                totalTxns, successCount.get(), errorCount.get());
+        measurementLogger.info("throughput: {} TPS, avg_latency: {} ms, p50: {} ms, p95: {} ms, p99: {} ms",
+                throughput, avgLatency, p50, p95, p99);
+        measurementLogger.info(SINGLE_LINE);
     }
 
     private long getPercentile(List<Long> sortedValues, double percentile) {
-        if (sortedValues.isEmpty()) return 0;
+        if (sortedValues.isEmpty())
+            return 0;
         int index = (int) Math.ceil(percentile * sortedValues.size()) - 1;
         index = Math.max(0, Math.min(index, sortedValues.size() - 1));
         return sortedValues.get(index);
@@ -345,8 +342,7 @@ public class SmallBankClient {
         int size = xml.configurationsAt("/works/work").size();
         config.phases = new Phase[size];
         for (int i = 1; i < size + 1; i++) {
-            final HierarchicalConfiguration<ImmutableNode> work =
-                    xml.configurationAt("works/work[" + i + "]");
+            final HierarchicalConfiguration<ImmutableNode> work = xml.configurationAt("works/work[" + i + "]");
             Phase phase = new Phase();
             phase.terminals = work.getInt("terminals", -1);
             phase.duration = work.getInt("time");
@@ -372,7 +368,7 @@ public class SmallBankClient {
         System.out.printf("Accounts: %d%n", config.numAccounts);
         System.out.printf("Terminals: %d%n", config.terminals);
         for (int i = 0; i < config.phases.length; i++) {
-            System.out.printf("Phase %d:%n", i+1);
+            System.out.printf("Phase %d:%n", i + 1);
             System.out.printf("Duration: %d seconds%n", config.phases[i].duration);
             System.out.printf("Rate: %.2f TPS/terminal%n", config.phases[i].rate);
             System.out.println("Weights: " + Arrays.toString(config.phases[i].weights));
@@ -383,12 +379,12 @@ public class SmallBankClient {
 
     private static XMLConfiguration buildConfiguration(String filename) throws ConfigurationException {
         Parameters params = new Parameters();
-        FileBasedConfigurationBuilder<XMLConfiguration> builder =
-                new FileBasedConfigurationBuilder<>(XMLConfiguration.class)
-                        .configure(params.xml()
-                                .setFileName(filename)
-                                .setListDelimiterHandler(new DisabledListDelimiterHandler())
-                                .setExpressionEngine(new XPathExpressionEngine()));
+        FileBasedConfigurationBuilder<XMLConfiguration> builder = new FileBasedConfigurationBuilder<>(
+                XMLConfiguration.class)
+                .configure(params.xml()
+                        .setFileName(filename)
+                        .setListDelimiterHandler(new DisabledListDelimiterHandler())
+                        .setExpressionEngine(new XPathExpressionEngine()));
         return builder.getConfiguration();
     }
 
@@ -412,9 +408,6 @@ public class SmallBankClient {
         int numAccounts;
         int terminals;
         int randomSeed;
-//        int duration;
-//        double rate;
-//        int[] weights;
         Phase[] phases;
     }
 

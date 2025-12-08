@@ -35,7 +35,7 @@ public class SmallBankServer extends DefaultRecoverable {
         this.accounts = new HashMap<>();
         this.checking = new HashMap<>();
         this.savings = new HashMap<>();
-        this.interval = 10;
+        this.interval = 100;
         this.consensusLatency = new Storage(this.interval);
         replica = new ServiceReplica(id, this, this);
     }
