@@ -112,6 +112,7 @@ public class InjectionClient {
     public void shutdown() {
         logger.info("Shutting down InjectionClient");
         scheduler.shutdown();
+        this.proxy.close();
         try {
             if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
                 scheduler.shutdownNow();

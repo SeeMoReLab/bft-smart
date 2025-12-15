@@ -275,7 +275,7 @@ public class ServersCommunicationLayer extends Thread {
 				} else {
                     // Schedule the send operation with a delay
                     long delayMillis = getDelayFromInjection(target, sm);
-                    logger.info("Sending message from:{} -> to:{} with delay: {}ms.", me,  target, delayMillis);
+                    // logger.info("Sending message from:{} -> to:{} with delay: {}ms.", me,  target, delayMillis);
                     final int finalTarget = target;
                     scheduler.schedule(() -> {
                         try {
