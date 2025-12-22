@@ -47,6 +47,9 @@ public class RequestsTimer {
     private TOMLayer tomLayer; // TOM layer
     private long timeout;
     private long shortTimeout;
+    private long backoffMultiplier;
+    private boolean timeoutBackoffEnabled;
+    private boolean resetBackoffOnNextViewChange;
     private TreeSet<TOMMessage> watched = new TreeSet<TOMMessage>();
     private ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
     
@@ -70,6 +73,9 @@ public class RequestsTimer {
         this.controller = controller;
         
         this.timeout = this.controller.getStaticConf().getRequestTimeout();
+        this.backoffMultiplier = 1;
+        this.timeoutBackoffEnabled = this.controller.getStaticConf().isRequestTimeoutBackoffEnabled();
+        this.resetBackoffOnNextViewChange = true;
         this.shortTimeout = -1;
     }
 
@@ -78,12 +84,19 @@ public class RequestsTimer {
     }
 
     public long getTimeout() {
-        return (shortTimeout > -1 ? shortTimeout : timeout);
+        long base = (shortTimeout > -1 ? shortTimeout : timeout);
+        if (backoffMultiplier <= 1) {
+            return base;
+        }
+
+        long maxMultiplier = (base == 0 ? Long.MAX_VALUE : Long.MAX_VALUE / base);
+        long effectiveMultiplier = Math.min(backoffMultiplier, maxMultiplier);
+        return base * effectiveMultiplier;
     }
     
     public void startTimer() {
         if (rtTask == null) {
-            long t = (shortTimeout > -1 ? shortTimeout : timeout);
+            long t = getTimeout();
             //shortTimeout = -1;
             rtTask = new RequestTimerTask();
             if (controller.getCurrentViewN() > 1) timer.schedule(rtTask, t);
@@ -149,7 +162,7 @@ public class RequestsTimer {
     
     public void run_lc_protocol() {
         
-        long t = (shortTimeout > -1 ? shortTimeout : timeout);
+        long t = getTimeout();
         
         //System.out.println("(RequestTimerTask.run) I SOULD NEVER RUN WHEN THERE IS NO TIMEOUT");
 
@@ -216,7 +229,7 @@ public class RequestsTimer {
         SendStopTask stopTask = new SendStopTask(stop);
         Timer stopTimer = new Timer("Stop message");
         
-        stopTimer.schedule(stopTask, timeout);
+        stopTimer.schedule(stopTask, getTimeout());
         
        stopTimers.put(regency, stopTimer);
 
@@ -247,6 +260,32 @@ public class RequestsTimer {
         stopAllSTOPs();
         LoggerFactory.getLogger(this.getClass()).info("RequestsTimer stopped.");
 
+    }
+
+    public void onViewChangeStarted() {
+
+        if (!timeoutBackoffEnabled) {
+            backoffMultiplier = 1;
+            resetBackoffOnNextViewChange = true;
+            return;
+        }
+
+        if (resetBackoffOnNextViewChange) {
+            backoffMultiplier = 1;
+            resetBackoffOnNextViewChange = false;
+        } else {
+            long base = (shortTimeout > -1 ? shortTimeout : timeout);
+            long maxMultiplier = (base == 0 ? Long.MAX_VALUE : Long.MAX_VALUE / base);
+            long doubled = backoffMultiplier > (maxMultiplier / 2) ? maxMultiplier : backoffMultiplier * 2;
+            backoffMultiplier = Math.max(1, doubled);
+        }
+
+        logger.info("Using request timeout {} ms for view-change attempt", getTimeout());
+    }
+
+    public void onViewInstalled() {
+        resetBackoffOnNextViewChange = true;
+        logger.info("View installed");
     }
     
     class RequestTimerTask extends TimerTask {

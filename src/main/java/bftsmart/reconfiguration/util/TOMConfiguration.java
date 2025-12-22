@@ -65,6 +65,7 @@ public class TOMConfiguration extends Configuration {
     private boolean fairbatch;
     private String bindAddress;
     private int clientInvokeOrderedTimeout;
+    private boolean requestTimeoutBackoffEnabled;
 
     /* Tulio Ribeiro*/
     //private Boolean ssltls=true;
@@ -115,6 +116,9 @@ public class TOMConfiguration extends Configuration {
                     requestTimeout = 0;
                 }
             }
+
+            s = (String) configs.remove("system.totalordermulticast.timeout.backoff");
+            requestTimeoutBackoffEnabled = (s != null) ? Boolean.parseBoolean(s) : false;
             
             s = (String) configs.remove("system.totalordermulticast.batchtimeout");
             if (s == null) {
@@ -462,6 +466,10 @@ public class TOMConfiguration extends Configuration {
 
     public int getRequestTimeout() {
         return requestTimeout;
+    }
+
+    public boolean isRequestTimeoutBackoffEnabled() {
+        return requestTimeoutBackoffEnabled;
     }
 
     public int getBatchTimeout() {
