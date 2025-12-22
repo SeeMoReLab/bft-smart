@@ -119,6 +119,8 @@ public class Synchronizer {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
 
         int regency = lcManager.getNextReg();
+
+        requestsTimer.onViewChangeStarted();
         
         requestsTimer.stopTimer();
         requestsTimer.Enabled(false);
@@ -1208,6 +1210,8 @@ public class Synchronizer {
                         acceptor.getFactory().createAccept(currentCID, e.getTimestamp(), e.propValueHash));
                 e.acceptSent();
             }
+
+            requestsTimer.onViewInstalled();
         } else {
             logger.warn("Sync phase failed for regency" + regency);
         }
