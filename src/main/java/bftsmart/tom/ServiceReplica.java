@@ -22,6 +22,7 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 import bftsmart.communication.ServerCommunicationSystem;
+import bftsmart.tom.core.ShardHandler;
 import bftsmart.tom.core.ExecutionManager;
 import bftsmart.consensus.messages.MessageFactory;
 import bftsmart.consensus.roles.Acceptor;
@@ -67,6 +68,9 @@ public class ServiceReplica {
 
     // replica ID
     private int id;
+    // sharding configuration
+    private int shardId = -1;
+    private String configHome = "";
     // Server side comunication system
     private ServerCommunicationSystem cs = null;
     private ReplyManager repMan = null;
@@ -83,6 +87,43 @@ public class ServiceReplica {
 
     /* Adaptive Timers */
     private LearningAgentClient learningAgentClient = null;
+
+    /**
+     * Constructor for sharded replica.
+     *
+     * @param shardId   Shard ID
+     * @param id        Replica ID within the shard
+     * @param executor  Executor
+     * @param recoverer Recoverer
+     */
+    public ServiceReplica(int shardId, int id, Executable executor, Recoverable recoverer) {
+        // Derive config path from shard/replica IDs
+        // this(shardId, id, "shard" + shardId + "/replica" + id + "/config", executor, recoverer);
+        this(shardId, id, "", executor, recoverer);
+    }
+
+    /**
+     * Constructor for sharded replica with explicit config path.
+     *
+     * @param shardId    Shard ID
+     * @param id         Replica ID within the shard
+     * @param configHome Path to configuration directory
+     * @param executor   Executor
+     * @param recoverer  Recoverer
+     */
+    public ServiceReplica(int shardId, int id, String configHome, Executable executor, Recoverable recoverer) {
+        this.id = id;
+        this.shardId = shardId;
+        this.configHome = configHome;
+        this.SVController = new ServerViewController(id, configHome, null);
+        this.executor = executor;
+        this.recoverer = recoverer;
+        this.replier = new DefaultReplier();
+        this.verifier = null;
+        this.init();
+        this.recoverer.setReplicaContext(replicaCtx);
+        this.replier.setReplicaContext(replicaCtx);
+    }
 
     /**
      * Constructor
@@ -488,8 +529,12 @@ public class ServiceReplica {
         ExecutionManager executionManager = new ExecutionManager(SVController, acceptor, proposer, id);
 
         acceptor.setExecutionManager(executionManager);
+        if (shardId != -1) {
+            tomLayer = new TOMLayer(executionManager, this, recoverer, acceptor, cs, SVController, verifier, shardId, configHome);
+        } else {
+            tomLayer = new TOMLayer(executionManager, this, recoverer, acceptor, cs, SVController, verifier);
+        }
 
-        tomLayer = new TOMLayer(executionManager, this, recoverer, acceptor, cs, SVController, verifier);
 
         executionManager.setTOMLayer(tomLayer);
 
@@ -537,6 +582,18 @@ public class ServiceReplica {
      */
     public int getId() {
         return id;
+    }
+
+    /**
+     * Get the ShardHandler for cross-shard communication.
+     *
+     * @return ShardHandler instance, or null if not sharded
+     */
+    public ShardHandler getShardHandler() {
+        if (tomLayer != null) {
+            return tomLayer.getShardHandler();
+        }
+        return null;
     }
 
     /* Adaptive Timers */

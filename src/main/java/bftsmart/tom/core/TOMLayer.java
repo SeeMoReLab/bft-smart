@@ -116,6 +116,48 @@ public final class TOMLayer extends Thread implements RequestReceiver {
 
     private final int myId;
 
+    private ShardHandler shardHandler = null;
+
+    public TOMLayer(ExecutionManager manager,
+                    ServiceReplica receiver,
+                    Recoverable recoverer,
+                    Acceptor a,
+                    ServerCommunicationSystem cs,
+                    ServerViewController controller,
+                    RequestVerifier verifier,
+                    int shardId) {
+        this(manager, receiver, recoverer, a, cs, controller, verifier);
+        this.shardHandler = new ShardHandler(shardId);
+    }
+
+    /**
+     * Constructor for cross-shard communication.
+     *
+     * @param shardId    This replica's shard ID
+     * @param configHome Path to this replica's config directory
+     */
+    public TOMLayer(ExecutionManager manager,
+                    ServiceReplica receiver,
+                    Recoverable recoverer,
+                    Acceptor a,
+                    ServerCommunicationSystem cs,
+                    ServerViewController controller,
+                    RequestVerifier verifier,
+                    int shardId,
+                    String configHome) {
+        this(manager, receiver, recoverer, a, cs, controller, verifier);
+        this.shardHandler = new ShardHandler(shardId, receiver.getId(), configHome);
+    }
+
+    /**
+     * Get the ShardHandler for cross-shard communication.
+     *
+     * @return ShardHandler instance, or null if not configured for sharding
+     */
+    public ShardHandler getShardHandler() {
+        return this.shardHandler;
+    }
+
     /**
      * Creates a new instance of TOMulticastLayer
      *
