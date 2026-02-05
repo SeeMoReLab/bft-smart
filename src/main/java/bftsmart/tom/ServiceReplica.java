@@ -584,13 +584,6 @@ public class ServiceReplica {
         return id;
     }
 
-    // /* Adaptive Timers */
-    // /**
-    //  * Learning Agent's gRPC client */
-    // public LearningAgentClient getLearningAgentClient() {
-    //     return learningAgentClient;
-    // }
-
     /**
      * Get the ShardHandler for cross-shard communication.
      *
@@ -602,6 +595,13 @@ public class ServiceReplica {
         }
         return null;
     }
+
+    // /* Adaptive Timers */
+    // /**
+    //  * Learning Agent's gRPC client */
+    // public LearningAgentClient getLearningAgentClient() {
+    //     return learningAgentClient;
+    // }
 
     public RequestsTimer getRequestsTimer() {
         return tomLayer.requestsTimer;
