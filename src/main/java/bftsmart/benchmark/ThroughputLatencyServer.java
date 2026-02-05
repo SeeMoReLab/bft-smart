@@ -1,6 +1,6 @@
 package bftsmart.benchmark;
 
-import bftsmart.rlrpc.Prediction;
+// import bftsmart.rlrpc.Prediction;
 import bftsmart.tom.MessageContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultSingleRecoverable;

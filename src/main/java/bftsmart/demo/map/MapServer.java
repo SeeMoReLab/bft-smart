@@ -13,7 +13,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import bftsmart.tom.MessageContext;
-import bftsmart.tom.ServiceReplica;
+// import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultSingleRecoverable;
 import bftsmart.tom.util.Storage;
 
@@ -22,14 +22,14 @@ public class MapServer<K, V> extends DefaultSingleRecoverable {
 	private Map<K, V> replicaMap;
 	private Logger logger;
 	private Storage consensusLatency = null;
-	private int iterations = 0;
-	private ServiceReplica serviceReplica = null;
+	// private int iterations = 0;
+	// private ServiceReplica serviceReplica = null;
 
 	public MapServer(int id) {
 		replicaMap = new TreeMap<>();
 		logger = Logger.getLogger(MapServer.class.getName());
 		consensusLatency = new Storage(10);
-		this.serviceReplica = new ServiceReplica(id, this, this);
+		// this.serviceReplica = new ServiceReplica(id, this, this);
 	}
 
 	public static void main(String[] args) {
@@ -48,20 +48,20 @@ public class MapServer<K, V> extends DefaultSingleRecoverable {
 			MapRequestType cmd = request.getType();
 			System.out.println("Start time: " + msgCtx.getFirstInBatch().consensusStartTime + ", decision time: " + msgCtx.getFirstInBatch().decisionTime);
 			consensusLatency.store(msgCtx.getFirstInBatch().decisionTime - msgCtx.getFirstInBatch().consensusStartTime);
-			iterations++;
-			if (iterations % 5 == 0) {
+			// iterations++;
+			// if (iterations % 5 == 0) {
 				
-				this.serviceReplica.getLearningAgentClient()
-					.predict(
-						10,
-						(float) consensusLatency.getAverage(false) / 1000,
-						(float) consensusLatency.getMax(false) / 1000,
-						(float) consensusLatency.getMin(false) / 1000,
-						(float) consensusLatency.getDP(true) / 1000
-					);
-				System.out.println("Consensus latency = " + consensusLatency.getAverage(false) / 1000 + " (+/- "+ (long)consensusLatency.getDP(false) / 1000 +") us ");
-            	consensusLatency.reset();
-			}
+			// 	this.serviceReplica.getLearningAgentClient()
+			// 		.predict(
+			// 			10,
+			// 			(float) consensusLatency.getAverage(false) / 1000,
+			// 			(float) consensusLatency.getMax(false) / 1000,
+			// 			(float) consensusLatency.getMin(false) / 1000,
+			// 			(float) consensusLatency.getDP(true) / 1000
+			// 		);
+			// 	System.out.println("Consensus latency = " + consensusLatency.getAverage(false) / 1000 + " (+/- "+ (long)consensusLatency.getDP(false) / 1000 +") us ");
+            // 	consensusLatency.reset();
+			// }
 			switch (cmd) {
 				//write operations on the map
 				case PUT:

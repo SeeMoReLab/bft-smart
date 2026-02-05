@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "bftsmart.rlrpc";
+
+import "google/protobuf/empty.proto";
+
+// Represents the current state
+message Report {
+    uint32 processed_transactions = 2;
+    float avg_message_delay = 3;
+    float max_message_delay = 4;
+    float min_message_delay = 5;
+    float std_message_delay = 6;
+}
+
+// Represents the local state
+message ReportLocal {
+    uint32 episode = 1;
+    Report report = 2;
+}
+
+// Represents the collection of state
+message ReportShared {
+    uint32 episode = 1;
+    repeated Report reports = 2;
+}
+
+// Timeout recommendation
+message Timeout {
+    uint32 episode = 1;
+    int32 timeout_milliseconds = 2;
+}
+
+// Data exchange service
+service DataExchange {
+    // Exchange data between agents
+    rpc ExchangeData(ReportShared) returns (google.protobuf.Empty);
+}
+
+// Learning agent service
+service LearningAgent {
+    // Send a report to the agent
+    rpc SendReport(ReportLocal) returns (Timeout);
+
+    // Share a report with other agents
+    rpc ShareReport(ReportLocal) returns (google.protobuf.Empty);
+
+    // Reset the agent's internal state/model
+    rpc Reset(google.protobuf.Empty) returns (google.protobuf.Empty);
+}

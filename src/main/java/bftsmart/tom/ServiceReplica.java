@@ -29,7 +29,7 @@ import bftsmart.consensus.roles.Proposer;
 import bftsmart.reconfiguration.ReconfigureReply;
 import bftsmart.reconfiguration.ServerViewController;
 import bftsmart.reconfiguration.VMMessage;
-import bftsmart.rlrpc.LearningAgentClient;
+// import bftsmart.rlrpc.LearningAgentClient;
 import bftsmart.tom.core.ReplyManager;
 import bftsmart.tom.core.TOMLayer;
 import bftsmart.tom.core.messages.TOMMessage;
@@ -81,8 +81,8 @@ public class ServiceReplica {
     private Replier replier = null;
     private RequestVerifier verifier = null;
 
-    /* Adaptive Timers */
-    private LearningAgentClient learningAgentClient = null;
+    // /* Adaptive Timers */
+    // private LearningAgentClient learningAgentClient = null;
 
     /**
      * Constructor
@@ -156,21 +156,21 @@ public class ServiceReplica {
             throw new RuntimeException("Unable to build a communication system.");
         }
 
-        /* Adaptive timers */
-        try {
-            String host = this.SVController.getStaticConf().getHost(this.id);
-            int learnerPort = this.SVController.getStaticConf().getLearnerPort(this.id);
-            if (learnerPort > 0) {
-                this.learningAgentClient = new LearningAgentClient(host, learnerPort);
-                System.out.println("Created learner client: " + host + " " + learnerPort);
-            } else {
-                System.out.println("Could not create learner client. LearnerPort is " + learnerPort);
-            }
+        // /* Adaptive timers */
+        // try {
+        //     String host = this.SVController.getStaticConf().getHost(this.id);
+        //     int learnerPort = this.SVController.getStaticConf().getLearnerPort(this.id);
+        //     if (learnerPort > 0) {
+        //         this.learningAgentClient = new LearningAgentClient(host, learnerPort);
+        //         System.out.println("Created learner client: " + host + " " + learnerPort);
+        //     } else {
+        //         System.out.println("Could not create learner client. LearnerPort is " + learnerPort);
+        //     }
             
-        } catch (Exception ex){
-            logger.error("Failed to initialize learning agent client", ex);
-            throw new RuntimeException("Unable to build learning agent client.");
-        }
+        // } catch (Exception ex){
+        //     logger.error("Failed to initialize learning agent client", ex);
+        //     throw new RuntimeException("Unable to build learning agent client.");
+        // }
 
         if (this.SVController.isInCurrentView()) {
             logger.info("In current view: " + this.SVController.getCurrentView());
@@ -539,12 +539,12 @@ public class ServiceReplica {
         return id;
     }
 
-    /* Adaptive Timers */
-    /**
-     * Learning Agent's gRPC client */
-    public LearningAgentClient getLearningAgentClient() {
-        return learningAgentClient;
-    }
+    // /* Adaptive Timers */
+    // /**
+    //  * Learning Agent's gRPC client */
+    // public LearningAgentClient getLearningAgentClient() {
+    //     return learningAgentClient;
+    // }
 
     public RequestsTimer getRequestsTimer() {
         return tomLayer.requestsTimer;

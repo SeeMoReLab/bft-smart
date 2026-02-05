@@ -15,8 +15,8 @@ limitations under the License.
 */
 package bftsmart.demo.microbenchmarks;
 
-import bftsmart.rlrpc.LearningAgentClient;
-import bftsmart.rlrpc.Prediction;
+// import bftsmart.rlrpc.LearningAgentClient;
+// import bftsmart.rlrpc.Prediction;
 import bftsmart.tom.MessageContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.CommandsInfo;
@@ -284,23 +284,23 @@ public final class ThroughputLatencyServer extends DefaultRecoverable{
             
             if (tp > maxTp) maxTp = tp;
 
-            /* Adaptive Timers */
-            if (this.replica.getLearningAgentClient() != null) {
-                Prediction prediction = this.replica.getLearningAgentClient()
-                    .predict(
-                        interval,
-                        (float) consensusLatency.getAverage(false) / 1000,
-                        (float) consensusLatency.getMax(false) / 1000,
-                        (float) consensusLatency.getMin(false) / 1000,
-                        (float) consensusLatency.getDP(false) / 1000
-                    );
-                System.out.println("Prediction ID: " + prediction.getPredictionId());
-                System.out.println("Suggested timeout: " + 
-                        prediction.getAction().getTimeoutMilliseconds() + " ms");
-                replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
-            }
-            System.out.println("Consensus latency = " + consensusLatency.getAverage(false) / 1000 + " (+/- "+ (long)consensusLatency.getDP(false) / 1000 +") us ");
-            consensusLatency.reset();
+            // /* Adaptive Timers */
+            // if (this.replica.getLearningAgentClient() != null) {
+            //     Prediction prediction = this.replica.getLearningAgentClient()
+            //         .predict(
+            //             interval,
+            //             (float) consensusLatency.getAverage(false) / 1000,
+            //             (float) consensusLatency.getMax(false) / 1000,
+            //             (float) consensusLatency.getMin(false) / 1000,
+            //             (float) consensusLatency.getDP(false) / 1000
+            //         );
+            //     System.out.println("Prediction ID: " + prediction.getPredictionId());
+            //     System.out.println("Suggested timeout: " + 
+            //             prediction.getAction().getTimeoutMilliseconds() + " ms");
+            //     replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
+            // }
+            // System.out.println("Consensus latency = " + consensusLatency.getAverage(false) / 1000 + " (+/- "+ (long)consensusLatency.getDP(false) / 1000 +") us ");
+            // consensusLatency.reset();
             
             System.out.println("Throughput = " + tp +" operations/sec (Maximum observed: " + maxTp + " ops/sec)");            
             

@@ -1,6 +1,6 @@
 package bftsmart.demo.smallbank;
 
-import bftsmart.rlrpc.Prediction;
+// import bftsmart.rlrpc.Prediction;
 import bftsmart.tom.MessageContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultRecoverable;
@@ -58,25 +58,25 @@ public class SmallBankServer extends DefaultRecoverable {
                 consensusLatency.store(msgCtx[index].getFirstInBatch().decisionTime - msgCtx[index].getFirstInBatch().consensusStartTime);
             }
 
-            if (iterations % interval == 0 && replica.getLearningAgentClient() != null) {
-                try {
-                    Prediction prediction = this.replica.getLearningAgentClient()
-                            .predict(
-                                    interval,
-                                    (float) consensusLatency.getAverage(false) / 1000000,
-                                    (float) consensusLatency.getMax(false) / 1000000,
-                                    (float) consensusLatency.getMin(false) / 1000000,
-                                    (float) consensusLatency.getDP(true) / 1000000
-                            );
-                    System.out.println("Prediction ID: " + prediction.getPredictionId());
-                    System.out.println("Suggested timeout: " +
-                            prediction.getAction().getTimeoutMilliseconds() + " ms");
-                    replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
-                    consensusLatency.reset();
-                } catch (Exception e) {
-                    System.out.println("Exception in getting timeout from agent: " + e.getMessage());
-                }
-            }
+            // if (iterations % interval == 0 && replica.getLearningAgentClient() != null) {
+            //     try {
+            //         Prediction prediction = this.replica.getLearningAgentClient()
+            //                 .predict(
+            //                         interval,
+            //                         (float) consensusLatency.getAverage(false) / 1000000,
+            //                         (float) consensusLatency.getMax(false) / 1000000,
+            //                         (float) consensusLatency.getMin(false) / 1000000,
+            //                         (float) consensusLatency.getDP(true) / 1000000
+            //                 );
+            //         System.out.println("Prediction ID: " + prediction.getPredictionId());
+            //         System.out.println("Suggested timeout: " +
+            //                 prediction.getAction().getTimeoutMilliseconds() + " ms");
+            //         replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
+            //         consensusLatency.reset();
+            //     } catch (Exception e) {
+            //         System.out.println("Exception in getting timeout from agent: " + e.getMessage());
+            //     }
+            // }
 
             SmallBankMessage request = SmallBankMessage.getObject(command);
             SmallBankMessage reply = SmallBankMessage.newErrorMessage("Unknown error");
