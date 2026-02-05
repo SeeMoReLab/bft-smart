@@ -549,4 +549,14 @@ public class ServiceReplica {
     public RequestsTimer getRequestsTimer() {
         return tomLayer.requestsTimer;
     }
+
+    /**
+     * Injects a client request directly into the TOM layer.
+     * This bypasses the network stack but preserves ordering semantics.
+     */
+    public void submitClientRequest(TOMMessage message) {
+        if (tomLayer != null) {
+            tomLayer.requestReceived(message, true);
+        }
+    }
 }
