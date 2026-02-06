@@ -388,6 +388,7 @@ public final class TOMLayer extends Thread implements RequestReceiver {
 		case ORDERED_REQUEST:
 		case UNORDERED_HASHED_REQUEST:
 		case UNORDERED_REQUEST:
+        case CROSS_SHARD_REQUEST:
 			// These messages should be processed
 			break;
         }
@@ -425,6 +426,13 @@ public final class TOMLayer extends Thread implements RequestReceiver {
                 return;
             }
             dt.deliverUnordered(msg, syncher.getLCManager().getLastReg());
+        } else if (msg.getReqType() == TOMMessageType.CROSS_SHARD_REQUEST) {
+            if (execManager.getCurrentLeader() == this.controller.getStaticConf().getProcessId()) {
+                logger.info("Received cross-shard TOMMessage from client " + msg.getSender() + " with sequence number " + msg.getSequence() + " for session " + msg.getSession());
+
+                shardHandler.handleIncomingCrossShardRequest(msg, this);
+            }
+            
         } else {
             logger.debug("Received TOMMessage from client " + msg.getSender() + " with sequence number " + msg.getSequence() + " for session " + msg.getSession());
 

@@ -34,15 +34,11 @@ public class SmallBankClient2PC {
     // Client configuration
     private final int clientId;
     private final WorkloadConfig config;
-    private final Random random;
 
     // Shard configuration
     private final int numShards;
     private final Map<Integer, ServiceProxy> shardProxies;
     private final Map<Integer, String> shardConfigPaths;
-
-    // 2PC coordinator (client-side)
-    private final ClientTwoPhaseCoordinator coordinator;
 
     // Statistics
     private final AtomicInteger successCount = new AtomicInteger(0);
@@ -134,7 +130,6 @@ public class SmallBankClient2PC {
                               Map<Integer, String> shardConfigPaths) {
         this.clientId = clientId;
         this.config = config;
-        this.random = new Random(config.randomSeed + clientId);
         this.numShards = numShards;
         this.shardConfigPaths = new HashMap<>(shardConfigPaths);
         this.shardProxies = new ConcurrentHashMap<>();
@@ -142,17 +137,7 @@ public class SmallBankClient2PC {
         // Initialize proxies for each shard
         initializeShardProxies();
 
-        // Create coordinator
-        this.coordinator = new ClientTwoPhaseCoordinator();
-
         System.out.printf("Client %d initialized with %d shards%n", clientId, numShards);
-    }
-
-    /**
-     * Constructor for single-shard mode.
-     */
-    public SmallBankClient2PC(int clientId, WorkloadConfig config) {
-        this(clientId, config, 1, Collections.singletonMap(0, "config"));
     }
 
     /**
@@ -210,6 +195,7 @@ public class SmallBankClient2PC {
 
             // Route to correct shard
             int targetShard = getShardForAccount(custId);
+            // System.out.println("Creating account " + custId + " on shard " + targetShard);
             ServiceProxy proxy = shardProxies.get(targetShard);
 
             try {
@@ -397,14 +383,26 @@ public class SmallBankClient2PC {
     }
 
     /**
-     * Execute a cross-shard transaction using 2PC.
+     * Execute a cross-shard transaction using leader-based 2PC.
+     * Sends CROSS_SHARD_REQUEST to the coordinator shard (shard containing sender account).
+     * The leader of that shard will coordinate the 2PC.
      */
     private boolean executeCrossShardTransaction(SmallBankMessage2PC.TransactionType type,
                                                   long custId1, long custId2, double amount) {
-        LOG.debug("Executing cross-shard {} between accounts {} (shard {}) and {} (shard {})",
-                  type, custId1, getShardForAccount(custId1), custId2, getShardForAccount(custId2));
+        // Send to coordinator shard (shard of sender/source account)
+        int coordinatorShard = getShardForAccount(custId1);
 
-        return coordinator.execute2PC(type, custId1, custId2, amount);
+        LOG.debug("Executing cross-shard {} between accounts {} (shard {}) and {} (shard {}), coordinator={}",
+                  type, custId1, coordinatorShard, custId2, getShardForAccount(custId2), coordinatorShard);
+
+        SmallBankMessage2PC request = SmallBankMessage2PC.newCrossShardRequest(
+                type, custId1, custId2, amount);
+
+        ServiceProxy proxy = shardProxies.get(coordinatorShard);
+        byte[] reply = proxy.invokeCrossShardRequest(request.getBytes());
+
+        SmallBankMessage2PC response = SmallBankMessage2PC.getObject(reply);
+        return response != null && response.getResult() == 0;
     }
 
     /**
@@ -412,13 +410,14 @@ public class SmallBankClient2PC {
      */
     private SmallBankMessage2PC buildTransactionMessage(SmallBankMessage2PC.TransactionType type,
                                                          long custId1, long custId2, double amount) {
+        // String txId = generateTransactionId();
         switch (type) {
             case DEPOSIT_CHECKING:
-                return SmallBankMessage2PC.newDepositCheckingRequest(custId1, amount);
+                return SmallBankMessage2PC.newDepositCheckingRequest(custId1, amount, null);
             case TRANSACT_SAVINGS:
                 return SmallBankMessage2PC.newTransactSavingsRequest(custId1, amount);
             case WRITE_CHECK:
-                return SmallBankMessage2PC.newWriteCheckRequest(custId1, amount);
+                return SmallBankMessage2PC.newWriteCheckRequest(custId1, amount, null);
             case SEND_PAYMENT:
                 return SmallBankMessage2PC.newSendPaymentRequest(custId1, custId2, amount);
             case AMALGAMATE:
@@ -427,175 +426,6 @@ public class SmallBankClient2PC {
                 return SmallBankMessage2PC.newBalanceRequest(custId1);
             default:
                 return null;
-        }
-    }
-
-    // Client-Side 2PC Coordinator
-
-    /**
-     * Client-side 2PC coordinator for cross-shard transactions.
-     */
-    private class ClientTwoPhaseCoordinator {
-        private final ExecutorService executor = Executors.newCachedThreadPool();
-
-        /**
-         * Execute a cross-shard transaction using 2PC.
-         */
-        public boolean execute2PC(SmallBankMessage2PC.TransactionType type,
-                                  long custId1, long custId2, double amount) {
-            String txId = generateTransactionId();
-
-            int shard1 = getShardForAccount(custId1);
-            int shard2 = getShardForAccount(custId2);
-
-            LOG.debug("2PC transaction {} starting: type={}, shards=[{}, {}]", txId, type, shard1, shard2);
-
-            // Build PREPARE messages for each shard
-            Map<Integer, SmallBankMessage2PC> prepareMessages = buildPrepareMessages(
-                    txId, type, custId1, custId2, amount, shard1, shard2);
-
-            // Phase 1: Send PREPARE to all shards in parallel
-            Map<Integer, SmallBankMessage2PC> prepareResponses = executePreparePhase(txId, prepareMessages);
-
-            // Check votes
-            boolean allPrepared = checkAllPrepared(prepareResponses);
-
-            // Phase 2: COMMIT or ABORT
-            if (allPrepared) {
-                LOG.debug("2PC transaction {} - all prepared, committing", txId);
-                executeCommitPhase(txId, prepareMessages.keySet());
-                return true;
-            } else {
-                LOG.debug("2PC transaction {} - prepare failed, aborting", txId);
-                executeAbortPhase(txId, prepareMessages.keySet());
-                return false;
-            }
-        }
-
-        private String generateTransactionId() {
-            return String.format("ctx-%d-%d-%d", clientId, System.currentTimeMillis(),
-                                txIdCounter.incrementAndGet());
-        }
-
-        private Map<Integer, SmallBankMessage2PC> buildPrepareMessages(
-                String txId, SmallBankMessage2PC.TransactionType type,
-                long custId1, long custId2, double amount, int shard1, int shard2) {
-
-            Map<Integer, SmallBankMessage2PC> messages = new HashMap<>();
-
-            switch (type) {
-                case SEND_PAYMENT:
-                    // Shard with source account: WRITE_CHECK (debit)
-                    messages.put(shard1, SmallBankMessage2PC.newPrepareRequest(
-                            txId, -1, shard1,
-                            SmallBankMessage2PC.TransactionType.WRITE_CHECK,
-                            custId1, amount));
-
-                    // Shard with dest account: DEPOSIT_CHECKING (credit)
-                    messages.put(shard2, SmallBankMessage2PC.newPrepareRequest(
-                            txId, -1, shard2,
-                            SmallBankMessage2PC.TransactionType.DEPOSIT_CHECKING,
-                            custId2, amount));
-                    break;
-
-                case AMALGAMATE:
-                    // This is more complex - simplified here
-                    messages.put(shard1, SmallBankMessage2PC.newPrepareRequest(
-                            txId, -1, shard1,
-                            SmallBankMessage2PC.TransactionType.DEPOSIT_CHECKING,
-                            custId1, 0));
-                    messages.put(shard2, SmallBankMessage2PC.newPrepareRequest(
-                            txId, -1, shard2,
-                            SmallBankMessage2PC.TransactionType.WRITE_CHECK,
-                            custId2, 0));
-                    break;
-
-                default:
-                    LOG.warn("Unsupported cross-shard transaction type: {}", type);
-            }
-
-            return messages;
-        }
-
-        private Map<Integer, SmallBankMessage2PC> executePreparePhase(
-                String txId, Map<Integer, SmallBankMessage2PC> prepareMessages) {
-
-            Map<Integer, Future<SmallBankMessage2PC>> futures = new HashMap<>();
-
-            for (Map.Entry<Integer, SmallBankMessage2PC> entry : prepareMessages.entrySet()) {
-                int shardId = entry.getKey();
-                SmallBankMessage2PC prepareMsg = entry.getValue();
-                ServiceProxy proxy = shardProxies.get(shardId);
-
-                futures.put(shardId, executor.submit(() -> {
-                    byte[] response = proxy.invokeOrdered(prepareMsg.getBytes());
-                    if (response == null) {
-                        return SmallBankMessage2PC.newPrepareFail(txId, "No response");
-                    }
-                    return SmallBankMessage2PC.getObject(response);
-                }));
-            }
-
-            Map<Integer, SmallBankMessage2PC> responses = new HashMap<>();
-            for (Map.Entry<Integer, Future<SmallBankMessage2PC>> entry : futures.entrySet()) {
-                try {
-                    SmallBankMessage2PC response = entry.getValue().get(30, TimeUnit.SECONDS);
-                    responses.put(entry.getKey(), response);
-                } catch (Exception e) {
-                    LOG.error("Error in PREPARE for shard {}", entry.getKey(), e);
-                    responses.put(entry.getKey(), SmallBankMessage2PC.newPrepareFail(txId, e.getMessage()));
-                }
-            }
-
-            return responses;
-        }
-
-        private boolean checkAllPrepared(Map<Integer, SmallBankMessage2PC> responses) {
-            for (SmallBankMessage2PC response : responses.values()) {
-                if (response == null || !response.isPrepareOk()) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private void executeCommitPhase(String txId, Set<Integer> shards) {
-            executePhase2(txId, shards, true);
-        }
-
-        private void executeAbortPhase(String txId, Set<Integer> shards) {
-            executePhase2(txId, shards, false);
-        }
-
-        private void executePhase2(String txId, Set<Integer> shards, boolean commit) {
-            SmallBankMessage2PC phase2Msg = commit
-                    ? SmallBankMessage2PC.newCommit(txId, -1)
-                    : SmallBankMessage2PC.newAbort(txId, -1);
-
-            List<Future<?>> futures = new ArrayList<>();
-            for (int shardId : shards) {
-                ServiceProxy proxy = shardProxies.get(shardId);
-                futures.add(executor.submit(() -> {
-                    try {
-                        proxy.invokeOrdered(phase2Msg.getBytes());
-                    } catch (Exception e) {
-                        LOG.error("Error in phase 2 for shard {}", shardId, e);
-                    }
-                }));
-            }
-
-            // Wait for all to complete
-            for (Future<?> future : futures) {
-                try {
-                    future.get(30, TimeUnit.SECONDS);
-                } catch (Exception e) {
-                    LOG.warn("Timeout waiting for phase 2 completion");
-                }
-            }
-        }
-
-        public void shutdown() {
-            executor.shutdown();
         }
     }
 
@@ -637,7 +467,6 @@ public class SmallBankClient2PC {
     }
 
     private void close() {
-        coordinator.shutdown();
         for (ServiceProxy proxy : shardProxies.values()) {
             proxy.close();
         }

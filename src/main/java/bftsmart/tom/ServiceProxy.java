@@ -180,6 +180,10 @@ public class ServiceProxy extends TOMSender {
         invoke(request, TOMMessageType.INJECTION_REQUEST);
     }
 
+	public byte[] invokeCrossShardRequest(byte[] request) {
+        return invoke(request, TOMMessageType.CROSS_SHARD_REQUEST);
+    }
+
 	/**
 	 * This method sends an unordered request to the replicas, and returns the related reply.
 	 * This method chooses randomly one replica to send the complete response, while the others
@@ -303,6 +307,11 @@ public class ServiceProxy extends TOMSender {
 	private AbstractRequestHandler createRequestHandler(TOMMessageType requestType) {
 		AbstractRequestHandler requestHandler;
 		int replyQuorumSize = getReplyQuorum();// size of the reply quorum
+		// Workaround: setting reply quorum to 1 since cross-shard handled by 2PC leader
+		// Needs changing
+		if (requestType == TOMMessageType.CROSS_SHARD_REQUEST) {
+			replyQuorumSize = 1;
+		}
 		int sequenceId = generateRequestId(requestType);
 		int operationId = generateOperationId();
 		if (requestType == TOMMessageType.UNORDERED_HASHED_REQUEST || requestType == TOMMessageType.ORDERED_HASHED_REQUEST) {
