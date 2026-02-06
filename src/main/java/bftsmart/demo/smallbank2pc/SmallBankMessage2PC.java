@@ -33,7 +33,7 @@ public class SmallBankMessage2PC implements Serializable {
         PREPARE_FAIL,   // Phase 1 response: Vote NO (must abort)
         COMMIT,         // Phase 2: Commit the transaction
         ABORT,          // Phase 2: Abort the transaction
-        ACK             // Acknowledgment of commit/abort
+        ACK,            // Acknowledgment of commit/abort
     }
 
     private TransactionType txType;
@@ -57,6 +57,11 @@ public class SmallBankMessage2PC implements Serializable {
         result = -1;
     }
 
+    private static String generateTransactionId() {
+        return String.format("%d-%d", System.currentTimeMillis(),
+                System.nanoTime());
+    }
+
     // CreateAccount
     public static SmallBankMessage2PC newCreateAccountRequest(long customerId, String customerName,
                                                            double savingsBalance, double checkingBalance) {
@@ -69,18 +74,28 @@ public class SmallBankMessage2PC implements Serializable {
         return message;
     }
 
+    // private static String generateTransactionId() {
+    //     return String.format("%d-%d", System.currentTimeMillis(),
+    //                         txIdCounter.incrementAndGet());
+    // }
+
     // DepositChecking
-    public static SmallBankMessage2PC newDepositCheckingRequest(long customerId, double amount) {
+    public static SmallBankMessage2PC newDepositCheckingRequest(long customerId, double amount, TwoPhaseType twoPhaseType) {
         SmallBankMessage2PC message = new SmallBankMessage2PC();
+        message.transactionId = generateTransactionId();
         message.txType = TransactionType.DEPOSIT_CHECKING;
         message.customerId = customerId;
         message.amount = amount;
+        if (twoPhaseType != null) {
+            message.twoPhaseType = twoPhaseType;
+        }
         return message;
     }
 
     // TransactSavings
     public static SmallBankMessage2PC newTransactSavingsRequest(long customerId, double amount) {
         SmallBankMessage2PC message = new SmallBankMessage2PC();
+        message.transactionId = generateTransactionId();
         message.txType = TransactionType.TRANSACT_SAVINGS;
         message.customerId = customerId;
         message.amount = amount;
@@ -88,17 +103,22 @@ public class SmallBankMessage2PC implements Serializable {
     }
 
     // WriteCheck
-    public static SmallBankMessage2PC newWriteCheckRequest(long customerId, double amount) {
+    public static SmallBankMessage2PC newWriteCheckRequest(long customerId, double amount, TwoPhaseType twoPhaseType) {
         SmallBankMessage2PC message = new SmallBankMessage2PC();
+        message.transactionId = generateTransactionId();
         message.txType = TransactionType.WRITE_CHECK;
         message.customerId = customerId;
         message.amount = amount;
+        if (twoPhaseType != null) {
+            message.twoPhaseType = twoPhaseType;
+        }
         return message;
     }
 
     // SendPayment
     public static SmallBankMessage2PC newSendPaymentRequest(long sourceCustomerId, long destCustomerId, double amount) {
         SmallBankMessage2PC message = new SmallBankMessage2PC();
+        message.transactionId = generateTransactionId();
         message.txType = TransactionType.SEND_PAYMENT;
         message.customerId = sourceCustomerId;
         message.destCustomerId = destCustomerId;
@@ -109,6 +129,7 @@ public class SmallBankMessage2PC implements Serializable {
     // Amalgamate
     public static SmallBankMessage2PC newAmalgamateRequest(long customerId1, long customerId2) {
         SmallBankMessage2PC message = new SmallBankMessage2PC();
+        message.transactionId = generateTransactionId();
         message.txType = TransactionType.AMALGAMATE;
         message.customerId = customerId1;
         message.destCustomerId = customerId2;
@@ -117,6 +138,7 @@ public class SmallBankMessage2PC implements Serializable {
 
     public static SmallBankMessage2PC newBalanceRequest(long customerId) {
         SmallBankMessage2PC message = new SmallBankMessage2PC();
+        message.transactionId = generateTransactionId();
         message.txType = TransactionType.BALANCE;
         message.customerId = customerId;
         return message;
@@ -234,6 +256,29 @@ public class SmallBankMessage2PC implements Serializable {
     }
 
     /**
+     * Create a COMMIT message with transaction details for phase 2.
+     * The server needs these details to execute the actual transaction.
+     *
+     * @param transactionId      The transaction ID
+     * @param coordinatorShardId The coordinator shard ID
+     * @param txType             The transaction type to execute
+     * @param customerId         The customer ID for this operation
+     * @param amount             The amount for this operation
+     * @return COMMIT message with transaction details
+     */
+    public static SmallBankMessage2PC newCommitWithDetails(String transactionId, int coordinatorShardId,
+                                                            TransactionType txType, long customerId, double amount) {
+        SmallBankMessage2PC message = new SmallBankMessage2PC();
+        message.twoPhaseType = TwoPhaseType.COMMIT;
+        message.transactionId = transactionId;
+        message.coordinatorShardId = coordinatorShardId;
+        message.txType = txType;
+        message.customerId = customerId;
+        message.amount = amount;
+        return message;
+    }
+
+    /**
      * Create an ABORT message for phase 2.
      */
     public static SmallBankMessage2PC newAbort(String transactionId, int coordinatorShardId) {
@@ -255,15 +300,37 @@ public class SmallBankMessage2PC implements Serializable {
         return message;
     }
 
+    /**
+     * Create a CROSS_SHARD_REQUEST message.
+     * Client sends this to the coordinator shard (shard containing sender account).
+     * The leader of that shard will coordinate the 2PC.
+     *
+     * @param txType         The transaction type (SEND_PAYMENT or AMALGAMATE)
+     * @param customerId     The source/first customer ID
+     * @param destCustomerId The destination/second customer ID
+     * @param amount         The transaction amount
+     * @return CROSS_SHARD_REQUEST message
+     */
+    public static SmallBankMessage2PC newCrossShardRequest(
+            TransactionType txType, long customerId, long destCustomerId, double amount) {
+        SmallBankMessage2PC message = new SmallBankMessage2PC();
+        // message.twoPhaseType = TwoPhaseType.CROSS_SHARD_REQUEST;
+        message.txType = txType;
+        message.customerId = customerId;
+        message.destCustomerId = destCustomerId;
+        message.amount = amount;
+        return message;
+    }
+
     // 2PC Helper Methods
     public boolean is2PCMessage() {
         return twoPhaseType != TwoPhaseType.NONE;
     }
-    
+
     public boolean isPrepareOk() {
         return twoPhaseType == TwoPhaseType.PREPARE_OK;
     }
-    
+
     public boolean isPrepareFail() {
         return twoPhaseType == TwoPhaseType.PREPARE_FAIL;
     }

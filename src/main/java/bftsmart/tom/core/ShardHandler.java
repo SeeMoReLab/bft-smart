@@ -1,6 +1,9 @@
 package bftsmart.tom.core;
 
+import bftsmart.demo.smallbank2pc.SmallBankMessage2PC;
 import bftsmart.tom.ServiceProxy;
+import bftsmart.tom.core.messages.TOMMessage;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,7 +27,7 @@ public class ShardHandler {
     // This replica's identity
     private final int shardId;
     private final int replicaId;
-    private final String configHome;
+    // private final String configHome;
 
     // Shard configuration
     private final int totalShards;
@@ -39,9 +42,7 @@ public class ShardHandler {
     // Executor for parallel cross-shard requests
     private final ExecutorService executor;
 
-    // Configuration for retry behavior
-    private int maxRetries = 3;
-    private long retryDelayMs = 1000;
+    private int timeoutMs = 5000; // Timeout for cross-shard requests
 
     public enum ConnectionState {
         NOT_CONNECTED,
@@ -69,7 +70,7 @@ public class ShardHandler {
     public ShardHandler(int shardId, int replicaId, String configHome) {
         this.shardId = shardId;
         this.replicaId = replicaId;
-        this.configHome = configHome;
+        // this.configHome = configHome;
         this.shardProxies = new ConcurrentHashMap<>();
         this.connectionStates = new ConcurrentHashMap<>();
         this.proxyLock = new ReentrantReadWriteLock();
@@ -79,8 +80,9 @@ public class ShardHandler {
         ShardConfig config = loadShardConfig(configHome);
         this.totalShards = config.totalShards;
         this.shardConfigPaths = config.shardConfigPaths;
-        this.maxRetries = config.maxRetries;
-        this.retryDelayMs = config.retryDelayMs;
+        this.timeoutMs = config.timeoutMs;
+        // this.maxRetries = config.maxRetries;
+        // this.retryDelayMs = config.retryDelayMs;
 
         // Initialize connection states for other shards
         for (int i = 0; i < totalShards; i++) {
@@ -105,7 +107,7 @@ public class ShardHandler {
                         Map<Integer, String> shardConfigPaths) {
         this.shardId = shardId;
         this.replicaId = replicaId;
-        this.configHome = "";
+        // this.configHome = "";
         this.totalShards = totalShards;
         this.shardConfigPaths = new ConcurrentHashMap<>(shardConfigPaths);
         this.shardProxies = new ConcurrentHashMap<>();
@@ -121,6 +123,10 @@ public class ShardHandler {
 
         logger.info("ShardHandler initialized programmatically for shard {} replica {}, total shards: {}",
                 shardId, replicaId, totalShards);
+    }
+
+    private int getShardForAccount(long accountId) {
+        return (int) (accountId % totalShards);
     }
 
 
@@ -151,94 +157,267 @@ public class ShardHandler {
         }
     }
 
-    /**
-     * Send an unordered request to a specific shard.
-     *
-     * @param targetShardId The shard to send the request to
-     * @param request       The serialized request payload
-     * @return The response from the target shard, or null on timeout/failure
-     */
-    public byte[] invokeUnorderedOnShard(int targetShardId, byte[] request) {
-        validateTargetShard(targetShardId);
-        ServiceProxy proxy = getOrCreateProxy(targetShardId);
+    public void handleIncomingCrossShardRequest(TOMMessage msg, TOMLayer tomLayer) {
+        // Run asynchronously to avoid blocking TOMLayer's message processing thread
+        executor.submit(() -> {
+            try {
+                doHandleCrossShardRequest(msg, tomLayer);
+            } catch (Exception e) {
+                logger.error("Error handling cross-shard request from client {}", msg.getSender(), e);
+                sendReplyToClient(msg, tomLayer,
+                        SmallBankMessage2PC.newErrorMessage("Internal error: " + e.getMessage()));
+            }
+        });
+    }
 
-        if (proxy == null) {
-            logger.error("Failed to get proxy for shard {}", targetShardId);
-            return null;
+    private void doHandleCrossShardRequest(TOMMessage msg, TOMLayer tomLayer) {
+        logger.info("Handling incoming cross-shard request from client {} with sequence number {} for session {}",
+                msg.getSender(), msg.getSequence(), msg.getSession());
+        SmallBankMessage2PC request = SmallBankMessage2PC.getObject(msg.getContent());
+        if (request == null) {
+            logger.error("Failed to deserialize incoming cross-shard request");
+            sendReplyToClient(msg, tomLayer,
+                    SmallBankMessage2PC.newErrorMessage("Failed to deserialize request"));
+            return;
         }
+
+        switch (request.getTxType()) {
+            case SEND_PAYMENT:
+                handleCrossShardSendPayment(request, msg, tomLayer);
+                break;
+            case AMALGAMATE:
+                handleCrossShardAmalgamate(request, msg, tomLayer);
+                break;
+            default:
+                logger.error("Unsupported cross-shard transaction type: {}", request.getTxType());
+                sendReplyToClient(msg, tomLayer,
+                        SmallBankMessage2PC.newErrorMessage("Unsupported cross-shard type: " + request.getTxType()));
+                break;
+        }
+    }
+
+    private void handleCrossShardSendPayment(SmallBankMessage2PC request, TOMMessage msg, TOMLayer tomLayer) {
+        // Generate a single transaction ID shared across the entire 2PC lifecycle
+        String txId = String.format("2pc-%d-%d-%d", shardId, System.currentTimeMillis(), System.nanoTime());
+
+        int senderShard = getShardForAccount(request.getCustomerId());
+        int receiverShard = getShardForAccount(request.getDestCustomerId());
+
+        logger.info("Starting 2PC for SEND_PAYMENT txId={}, sender={} (shard {}), receiver={} (shard {})",
+                txId, request.getCustomerId(), senderShard, request.getDestCustomerId(), receiverShard);
+
+        ServiceProxy senderProxy = getOrCreateProxy(senderShard);
+        ServiceProxy receiverProxy = getOrCreateProxy(receiverShard);
+
+        if (senderProxy == null || receiverProxy == null) {
+            logger.error("Failed to get proxies for 2PC: senderProxy={}, receiverProxy={}",
+                    senderProxy != null ? "OK" : "null", receiverProxy != null ? "OK" : "null");
+            sendReplyToClient(msg, tomLayer,
+                    SmallBankMessage2PC.newErrorMessage("Failed to connect to participant shards"));
+            return;
+        }
+
+        // Phase 1: PREPARE
+        SmallBankMessage2PC senderPrepare = SmallBankMessage2PC.newPrepareRequest(
+                txId, shardId, senderShard,
+                SmallBankMessage2PC.TransactionType.WRITE_CHECK,
+                request.getCustomerId(), request.getAmount());
+        SmallBankMessage2PC receiverPrepare = SmallBankMessage2PC.newPrepareRequest(
+                txId, shardId, receiverShard,
+                SmallBankMessage2PC.TransactionType.DEPOSIT_CHECKING,
+                request.getDestCustomerId(), request.getAmount());
+
+        // Send PREPAREs in parallel
+        Future<byte[]> senderFuture = executor.submit(() -> senderProxy.invokeOrdered(senderPrepare.getBytes()));
+        Future<byte[]> receiverFuture = executor.submit(() -> receiverProxy.invokeOrdered(receiverPrepare.getBytes()));
+
+        byte[] senderReply, receiverReply;
+        try {
+            senderReply = senderFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
+            receiverReply = receiverFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            logger.error("Timeout/error during PREPARE phase for txId={}", txId, e);
+            // Best-effort abort on both shards
+            abortBestEffort(txId, senderProxy, receiverProxy);
+            sendReplyToClient(msg, tomLayer,
+                    SmallBankMessage2PC.newErrorMessage("2PC prepare timeout"));
+            return;
+        }
+
+        // Check prepare replies
+        SmallBankMessage2PC senderResp = SmallBankMessage2PC.getObject(senderReply);
+        SmallBankMessage2PC receiverResp = SmallBankMessage2PC.getObject(receiverReply);
+        boolean senderOk = senderResp != null && senderResp.getResult() == 0;
+        boolean receiverOk = receiverResp != null && receiverResp.getResult() == 0;
+
+        if (!senderOk || !receiverOk) {
+            logger.info("PREPARE failed for txId={}: sender={}, receiver={}", txId,
+                    senderOk ? "OK" : (senderResp != null ? senderResp.getErrorMsg() : "null"),
+                    receiverOk ? "OK" : (receiverResp != null ? receiverResp.getErrorMsg() : "null"));
+            // Send ABORTs with the same txId so servers can find and release locks
+            abortBestEffort(txId, senderProxy, receiverProxy);
+            sendReplyToClient(msg, tomLayer,
+                    SmallBankMessage2PC.newErrorMessage("2PC prepare failed"));
+            return;
+        }
+
+        // Phase 2: COMMIT — use the same txId so servers match to the prepared transaction
+        logger.info("All PREPAREs successful for txId={}, sending COMMITs", txId);
+        SmallBankMessage2PC senderCommit = SmallBankMessage2PC.newCommitWithDetails(
+                txId, shardId,
+                SmallBankMessage2PC.TransactionType.WRITE_CHECK,
+                request.getCustomerId(), request.getAmount());
+        SmallBankMessage2PC receiverCommit = SmallBankMessage2PC.newCommitWithDetails(
+                txId, shardId,
+                SmallBankMessage2PC.TransactionType.DEPOSIT_CHECKING,
+                request.getDestCustomerId(), request.getAmount());
+
+        Future<byte[]> senderCommitFuture = executor.submit(() -> senderProxy.invokeOrdered(senderCommit.getBytes()));
+        Future<byte[]> receiverCommitFuture = executor.submit(() -> receiverProxy.invokeOrdered(receiverCommit.getBytes()));
 
         try {
-            return proxy.invokeUnordered(request);
+            senderCommitFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
+            receiverCommitFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
-            logger.error("Error invoking unordered request on shard {}", targetShardId, e);
-            handleProxyFailure(targetShardId, e);
-            return null;
+            logger.error("Timeout/error during COMMIT phase for txId={}", txId, e);
+            sendReplyToClient(msg, tomLayer,
+                    SmallBankMessage2PC.newErrorMessage("2PC commit timeout"));
+            return;
         }
+
+        logger.info("2PC COMMIT successful for txId={}", txId);
+        sendReplyToClient(msg, tomLayer, SmallBankMessage2PC.newResponse(0));
     }
 
-    /**
-     * Send ordered requests to multiple shards in parallel.
-     *
-     * @param targetShards Map of shardId to request payload
-     * @return Map of shardId to response
-     */
-    public Map<Integer, byte[]> invokeOrderedOnMultipleShards(Map<Integer, byte[]> targetShards) {
-        Map<Integer, Future<byte[]>> futures = new HashMap<>();
+    private void handleCrossShardAmalgamate(SmallBankMessage2PC request, TOMMessage msg, TOMLayer tomLayer) {
+        // Generate a single transaction ID shared across the entire 2PC lifecycle
+        String txId = String.format("2pc-%d-%d-%d", shardId, System.currentTimeMillis(), System.nanoTime());
 
-        for (Map.Entry<Integer, byte[]> entry : targetShards.entrySet()) {
-            int targetShardId = entry.getKey();
-            byte[] request = entry.getValue();
+        int destShard = getShardForAccount(request.getCustomerId());
+        int sourceShard = getShardForAccount(request.getDestCustomerId());
 
-            Future<byte[]> future = executor.submit(() ->
-                    invokeOrderedOnShard(targetShardId, request)
-            );
-            futures.put(targetShardId, future);
+        logger.info("Starting 2PC for AMALGAMATE txId={}, custId1={} (shard {}), custId2={} (shard {})",
+                txId, request.getCustomerId(), destShard, request.getDestCustomerId(), sourceShard);
+
+        ServiceProxy destProxy = getOrCreateProxy(destShard);
+        ServiceProxy sourceProxy = getOrCreateProxy(sourceShard);
+
+        if (destProxy == null || sourceProxy == null) {
+            logger.error("Failed to get proxies for 2PC: destProxy={}, sourceProxy={}",
+                    destProxy != null ? "OK" : "null", sourceProxy != null ? "OK" : "null");
+            sendReplyToClient(msg, tomLayer,
+                    SmallBankMessage2PC.newErrorMessage("Failed to connect to participant shards"));
+            return;
         }
 
-        // Collect results
-        Map<Integer, byte[]> results = new HashMap<>();
-        for (Map.Entry<Integer, Future<byte[]>> entry : futures.entrySet()) {
+        // Phase 1: PREPARE
+        SmallBankMessage2PC destPrepare = SmallBankMessage2PC.newPrepareRequest(
+                txId, shardId, destShard,
+                SmallBankMessage2PC.TransactionType.TRANSACT_SAVINGS,
+                request.getCustomerId(), request.getAmount());
+        SmallBankMessage2PC sourcePrepare = SmallBankMessage2PC.newPrepareRequest(
+                txId, shardId, sourceShard,
+                SmallBankMessage2PC.TransactionType.WRITE_CHECK,
+                request.getDestCustomerId(), request.getAmount());
+
+        // Send PREPAREs
+        Future<byte[]> destFuture = executor.submit(() -> destProxy.invokeOrdered(destPrepare.getBytes()));
+        Future<byte[]> sourceFuture = executor.submit(() -> sourceProxy.invokeOrdered(sourcePrepare.getBytes()));
+
+        byte[] destReply, sourceReply;
+        try {
+            destReply = destFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
+            sourceReply = sourceFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            logger.error("Timeout/error during PREPARE phase for txId={}", txId, e);
+            // Best-effort abort on both shards
+            abortBestEffort(txId, destProxy, sourceProxy);
+            sendReplyToClient(msg, tomLayer,
+                    SmallBankMessage2PC.newErrorMessage("2PC prepare timeout"));
+            return;
+        }
+
+        // Check prepare replies
+        SmallBankMessage2PC destResp = SmallBankMessage2PC.getObject(destReply);
+        SmallBankMessage2PC sourceResp = SmallBankMessage2PC.getObject(sourceReply);
+        boolean destOk = destResp != null && destResp.getResult() == 0;
+        boolean sourceOk = sourceResp != null && sourceResp.getResult() == 0;
+
+        if (!destOk || !sourceOk) {
+            logger.info("PREPARE failed for txId={}: dest={}, source={}", txId,
+                    destOk ? "OK" : (destResp != null ? destResp.getErrorMsg() : "null"),
+                    sourceOk ? "OK" : (sourceResp != null ? sourceResp.getErrorMsg() : "null"));
+            // Send ABORTs with the same txId so servers can find and release locks
+            abortBestEffort(txId, destProxy, sourceProxy);
+            sendReplyToClient(msg, tomLayer,
+                    SmallBankMessage2PC.newErrorMessage("2PC prepare failed"));
+            return;
+        }
+
+        // Phase 2: COMMIT
+        logger.info("All PREPAREs successful for txId={}, sending COMMITs", txId);
+        SmallBankMessage2PC destCommit = SmallBankMessage2PC.newCommitWithDetails(
+                txId, shardId,
+                SmallBankMessage2PC.TransactionType.TRANSACT_SAVINGS,
+                request.getCustomerId(), request.getAmount());
+        SmallBankMessage2PC sourceCommit = SmallBankMessage2PC.newCommitWithDetails(
+                txId, shardId,
+                SmallBankMessage2PC.TransactionType.WRITE_CHECK,
+                request.getDestCustomerId(), request.getAmount());
+
+        Future<byte[]> destCommitFuture = executor.submit(() -> destProxy.invokeOrdered(destCommit.getBytes()));
+        Future<byte[]> sourceCommitFuture = executor.submit(() -> sourceProxy.invokeOrdered(sourceCommit.getBytes()));
+
+        try {
+            destCommitFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
+            sourceCommitFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            logger.error("Timeout/error during COMMIT phase for txId={}", txId, e);
+            sendReplyToClient(msg, tomLayer,
+                    SmallBankMessage2PC.newErrorMessage("2PC commit timeout"));
+            return;
+        }
+
+        logger.info("2PC COMMIT successful for txId={}", txId);
+        sendReplyToClient(msg, tomLayer, SmallBankMessage2PC.newResponse(0));
+    }
+
+    private void abortBestEffort(String txId, ServiceProxy senderProxy, ServiceProxy receiverProxy) {
+        SmallBankMessage2PC abortMsg = SmallBankMessage2PC.newAbort(txId, shardId);
+        Future<?> senderAbort = executor.submit(() -> {
             try {
-                byte[] response = entry.getValue().get(30, TimeUnit.SECONDS);
-                results.put(entry.getKey(), response);
+                senderProxy.invokeOrdered(abortMsg.getBytes());
             } catch (Exception e) {
-                logger.error("Error getting response from shard {}", entry.getKey(), e);
-                results.put(entry.getKey(), null);
+                logger.warn("Error sending ABORT to sender shard for txId={}: {}", txId, e.getMessage());
             }
+        });
+        Future<?> receiverAbort = executor.submit(() -> {
+            try {
+                receiverProxy.invokeOrdered(abortMsg.getBytes());
+            } catch (Exception e) {
+                logger.warn("Error sending ABORT to receiver shard for txId={}: {}", txId, e.getMessage());
+            }
+        });
+        try {
+            senderAbort.get(timeoutMs, TimeUnit.MILLISECONDS);
+            receiverAbort.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            logger.warn("Timeout waiting for ABORT completion for txId={}: {}", txId, e.getMessage());
         }
-
-        return results;
     }
 
-    /**
-     * Invoke with automatic retry on failure.
-     *
-     * @param targetShardId The shard to send the request to
-     * @param request       The serialized request payload
-     * @return The response, or null if all retries failed
-     */
-    public byte[] invokeOrderedWithRetry(int targetShardId, byte[] request) {
-        for (int attempt = 0; attempt < maxRetries; attempt++) {
-            byte[] response = invokeOrderedOnShard(targetShardId, request);
-            if (response != null) {
-                return response;
-            }
-
-            logger.warn("Attempt {} failed for shard {}, retrying...", attempt + 1, targetShardId);
-
-            // Try reconnecting
-            reconnectToShard(targetShardId);
-
-            try {
-                Thread.sleep(retryDelayMs * (attempt + 1));
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-
-        logger.error("All {} retry attempts failed for shard {}", maxRetries, targetShardId);
-        return null;
+    private void sendReplyToClient(TOMMessage originalMsg, TOMLayer tomLayer, SmallBankMessage2PC response) {
+        TOMMessage replyMsg = new TOMMessage(
+                tomLayer.controller.getStaticConf().getProcessId(),
+                originalMsg.getSession(),
+                originalMsg.getSequence(),
+                originalMsg.getOperationId(),
+                response.getBytes(),
+                tomLayer.controller.getCurrentViewId(),
+                originalMsg.getReqType()
+        );
+        tomLayer.getCommunication().send(new int[]{originalMsg.getSender()}, replyMsg);
+        logger.debug("Sent 2PC reply to client {}: result={}", originalMsg.getSender(), response.getResult());
     }
 
     // Proxy Management
@@ -310,23 +489,6 @@ public class ShardHandler {
                 targetShardId;
     }
 
-    // Connections
-
-    public void initializeAllConnections() {
-        logger.info("Eagerly initializing connections to {} other shards", totalShards - 1);
-
-        for (int i = 0; i < totalShards; i++) {
-            if (i != shardId) {
-                getOrCreateProxy(i);
-            }
-        }
-
-        long connected = connectionStates.values().stream()
-                .filter(s -> s == ConnectionState.CONNECTED)
-                .count();
-
-        logger.info("Initialized {} of {} cross-shard connections", connected, totalShards - 1);
-    }
 
     private void handleProxyFailure(int targetShardId, Exception e) {
         proxyLock.writeLock().lock();
@@ -377,7 +539,8 @@ public class ShardHandler {
     private ShardConfig loadShardConfig(String configHome) {
         ShardConfig config = new ShardConfig();
         String sep = System.getProperty("file.separator");
-        String path = configHome + sep + "shards.config";
+        // String path = configHome + sep + "shards.config";
+        String path = "config/shards.config";
 
         try (BufferedReader reader = new BufferedReader(new FileReader(path))) {
             Properties props = new Properties();
@@ -387,7 +550,8 @@ public class ShardHandler {
                     props.getProperty("system.shards.count", "1"));
 
             String basePath = props.getProperty("system.shards.basePath", "");
-
+            config.timeoutMs = Integer.parseInt(
+                    props.getProperty("system.shards.timeoutMs", "5000"));
             config.shardConfigPaths = new HashMap<>();
             for (int i = 0; i < config.totalShards; i++) {
                 String shardConfigHome = props.getProperty("shard." + i + ".configHome");
@@ -399,12 +563,6 @@ public class ShardHandler {
                     config.shardConfigPaths.put(i, shardConfigHome);
                 }
             }
-
-            // Load retry configuration
-            config.maxRetries = Integer.parseInt(
-                    props.getProperty("system.shards.maxRetries", "3"));
-            config.retryDelayMs = Long.parseLong(
-                    props.getProperty("system.shards.retryDelayMs", "1000"));
 
             logger.info("Loaded shard config: {} shards from {}", config.totalShards, path);
             return config;
@@ -422,8 +580,11 @@ public class ShardHandler {
     private static class ShardConfig {
         int totalShards = 1;
         Map<Integer, String> shardConfigPaths = new HashMap<>();
-        int maxRetries = 3;
-        long retryDelayMs = 1000;
+        int timeoutMs = 5000;
+    }
+
+    public void setTimeoutMs(int timeoutMs) {
+        this.timeoutMs = timeoutMs;
     }
 
     // Util
@@ -433,10 +594,10 @@ public class ShardHandler {
                     "Invalid target shard: " + targetShardId +
                             ", total shards: " + totalShards);
         }
-        if (targetShardId == shardId) {
-            throw new IllegalArgumentException(
-                    "Cannot send cross-shard request to own shard: " + targetShardId);
-        }
+        // if (targetShardId == shardId) {
+        //     throw new IllegalArgumentException(
+        //             "Cannot send cross-shard request to own shard: " + targetShardId);
+        // }
     }
     
     public int getShardId() {

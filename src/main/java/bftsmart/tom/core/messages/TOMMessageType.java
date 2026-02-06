@@ -29,7 +29,8 @@ public enum TOMMessageType {
     STATUS_REPLY,// 5
     UNORDERED_HASHED_REQUEST, //6
 	ORDERED_HASHED_REQUEST, //7
-    INJECTION_REQUEST; //8
+    INJECTION_REQUEST, //8
+    CROSS_SHARD_REQUEST; //9
 
 	public static TOMMessageType[] values = values();
 

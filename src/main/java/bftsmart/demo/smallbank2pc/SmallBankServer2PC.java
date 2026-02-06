@@ -2,6 +2,7 @@ package bftsmart.demo.smallbank2pc;
 
 import bftsmart.rlrpc.Prediction;
 import bftsmart.tom.MessageContext;
+import bftsmart.tom.ReplicaContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultRecoverable;
 import bftsmart.tom.util.Storage;
@@ -33,46 +34,101 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     private int iterations = 0;
     private ServiceReplica replica;
 
+    // Shard configuration (for logging/debugging)
+    private ReplicaContext replicaContext;
+    private int myReplicaId;
+    private int myShardId;
+    private int totalShards;
+
     /**
      * Represents a transaction that has been prepared but not yet committed/aborted.
+     *
+     * Simplified design:
+     * - PREPARE: validate + acquire locks (no state changes)
+     * - COMMIT: execute transaction + release locks
+     * - ABORT: just release locks
      */
     private static class PendingTransaction {
         final String transactionId;
-        final SmallBankMessage2PC request;
         final Set<Long> lockedAccountIds;
         final long prepareTime;
 
-        // Stored values for rollback (original state before prepare)
-        final Map<Long, Double> originalCheckingBalances = new HashMap<>();
-        final Map<Long, Double> originalSavingsBalances = new HashMap<>();
+        // Transaction details (needed for execution on commit)
+        final SmallBankMessage2PC.TransactionType txType;
+        final long customerId;
+        final double amount;
 
-        // Computed values to apply on commit
-        final Map<Long, Double> newCheckingBalances = new HashMap<>();
-        final Map<Long, Double> newSavingsBalances = new HashMap<>();
-
-        PendingTransaction(String txId, SmallBankMessage2PC req, Set<Long> locks) {
+        PendingTransaction(String txId, Set<Long> locks,
+                          SmallBankMessage2PC.TransactionType txType,
+                          long customerId, double amount) {
             this.transactionId = txId;
-            this.request = req;
             this.lockedAccountIds = locks;
             this.prepareTime = System.currentTimeMillis();
+            this.txType = txType;
+            this.customerId = customerId;
+            this.amount = amount;
         }
     }
 
     public static void main(String[] args) throws Exception {
         if (args.length == 2) {
             new SmallBankServer2PC(Integer.parseInt(args[0]), Integer.parseInt(args[1]));
+        } else if (args.length == 3) {
+            // Usage with total shards specified
+            new SmallBankServer2PC(
+                    Integer.parseInt(args[0]),  // shardId
+                    Integer.parseInt(args[1]),  // replicaId
+                    Integer.parseInt(args[2]),  // totalShards
+                    null                         // configHome (use default)
+            );
+        } else if (args.length == 4) {
+            // Usage with total shards and config home
+            new SmallBankServer2PC(
+                    Integer.parseInt(args[0]),  // shardId
+                    Integer.parseInt(args[1]),  // replicaId
+                    Integer.parseInt(args[2]),  // totalShards
+                    args[3]                      // configHome
+            );
         } else {
-            System.out.println("Usage: java ... SmallBankServer2PC <shard_id> <replica_id>");
+            System.out.println("Usage: java ... SmallBankServer2PC <shard_id> <replica_id> [<total_shards> [<config_home>]]");
         }
     }
 
     private SmallBankServer2PC(int shardId, int id) {
+        this(shardId, id, 1, null);
+    }
+
+    /**
+     * Constructor with shard configuration for leader-based 2PC.
+     *
+     * @param shardId     This shard's ID
+     * @param replicaId   This replica's ID within the shard
+     * @param totalShards Total number of shards in the system
+     * @param configHome  Configuration directory (null for default)
+     */
+    public SmallBankServer2PC(int shardId, int replicaId, int totalShards, String configHome) {
+        this.myShardId = shardId;
+        this.myReplicaId = replicaId;
+        this.totalShards = totalShards;
         this.accounts = new HashMap<>();
         this.checking = new HashMap<>();
         this.savings = new HashMap<>();
         this.interval = 10;
         this.consensusLatency = new Storage(this.interval);
-        replica = new ServiceReplica(shardId, id, this, this);
+
+        if (configHome != null) {
+            replica = new ServiceReplica(shardId, replicaId, configHome, this, this);
+        } else {
+            replica = new ServiceReplica(shardId, replicaId, this, this);
+        }
+    }
+
+    @Override
+    public void setReplicaContext(ReplicaContext ctx) {
+        super.setReplicaContext(ctx);
+        this.replicaContext = ctx;
+        this.myReplicaId = ctx.getSVController().getStaticConf().getProcessId();
+        logger.info("ReplicaContext set: shardId={}, replicaId={}", myShardId, myReplicaId);
     }
 
     @Override
@@ -107,6 +163,10 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                     System.out.println("Suggested timeout: " +
                             prediction.getAction().getTimeoutMilliseconds() + " ms");
                     replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
+
+                    // Setting 2PC timeout here
+                    // replica.getShardHandler().setTimeoutMs(prediction.getAction().getTimeoutMilliseconds());
+
                     consensusLatency.reset();
                 } catch (Exception e) {
                     System.out.println("Exception in getting timeout from agent: " + e.getMessage());
@@ -126,7 +186,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             }
 
             try {
-                // Check if this is a 2PC message
+                // Handle 2PC messages (PREPARE, COMMIT, ABORT) from coordinator
                 if (request.is2PCMessage()) {
                     reply = handle2PCMessage(request);
                     replies[index++] = reply.getBytes();
@@ -136,7 +196,6 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                 // Regular transaction processing
                 switch (request.getTxType()) {
                     case CREATE_ACCOUNT: {
-//                        System.out.println("[INFO] Creating account for " + request);
                         long custId = request.getCustomerId();
                         if (accounts.containsKey(custId)) {
                             reply = SmallBankMessage2PC.newErrorMessage("Account already exists");
@@ -156,6 +215,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                         } else {
                             double balance = checking.get(custId) + request.getAmount();
                             checking.put(custId, balance);
+                            System.out.println("New checking balance for customer " + custId + ": " + balance);
                             reply = SmallBankMessage2PC.newResponse(0);
                         }
                         break;
@@ -313,12 +373,15 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         }
     }
 
-    // ==================== 2PC Handler Methods ====================
+    // 2PC Handler Methods
 
     /**
      * Main dispatcher for 2PC messages.
      */
     private SmallBankMessage2PC handle2PCMessage(SmallBankMessage2PC request) {
+        System.out.println("[INFO] Handling 2PC message: " + request);
+        System.out.println("[INFO] Current locked accounts: " + lockedAccounts);
+        System.out.println("[INFO] TwoPhaseType: " + request.getTwoPhaseType());
         switch (request.getTwoPhaseType()) {
             case PREPARE:
                 return handlePrepare(request);
@@ -335,14 +398,16 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     /**
      * Handle PREPARE phase of 2PC.
      * Validates the transaction can succeed and acquires locks.
+     * No state changes are made - just validation and locking.
      */
     private SmallBankMessage2PC handlePrepare(SmallBankMessage2PC request) {
         String txId = request.getTransactionId();
-        logger.info("PREPARE received for txId={}, type={}", txId, request.getTxType());
+        logger.info("PREPARE received for txId={}, type={}, customerId={}, amount={}",
+                   txId, request.getTxType(), request.getCustomerId(), request.getAmount());
 
         // Check if we already have this transaction prepared
         if (pendingTransactions.containsKey(txId)) {
-            logger.warn("Transaction {} already prepared", txId);
+            logger.info("Transaction {} already prepared", txId);
             return SmallBankMessage2PC.newPrepareOk(txId);
         }
 
@@ -351,7 +416,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
 
         // Try to acquire locks
         if (!tryAcquireLocks(accountsToLock)) {
-            logger.warn("Cannot acquire locks for transaction {}, accounts {} are locked", txId, accountsToLock);
+            logger.info("Cannot acquire locks for transaction {}, accounts {} are locked", txId, accountsToLock);
             return SmallBankMessage2PC.newPrepareFail(txId, "Cannot acquire locks - accounts busy");
         }
 
@@ -360,13 +425,16 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         if (validationError != null) {
             // Release locks on validation failure
             releaseLocks(accountsToLock);
-            logger.warn("Validation failed for transaction {}: {}", txId, validationError);
+            logger.info("Validation failed for transaction {}: {}", txId, validationError);
             return SmallBankMessage2PC.newPrepareFail(txId, validationError);
         }
 
-        // Create pending transaction and compute new values
-        PendingTransaction pending = new PendingTransaction(txId, request, accountsToLock);
-        computeTransactionChanges(request, pending);
+        // Create pending transaction - just track locks and transaction details
+        // No state changes yet - those happen in COMMIT
+        PendingTransaction pending = new PendingTransaction(
+            txId, accountsToLock,
+            request.getTxType(), request.getCustomerId(), request.getAmount()
+        );
         pendingTransactions.put(txId, pending);
 
         logger.info("PREPARE successful for txId={}", txId);
@@ -375,31 +443,76 @@ public class SmallBankServer2PC extends DefaultRecoverable {
 
     /**
      * Handle COMMIT phase of 2PC.
-     * Applies the prepared transaction and releases locks.
+     * Executes the actual transaction and releases locks.
+     * Transaction details come from the COMMIT message.
      */
     private SmallBankMessage2PC handleCommit(SmallBankMessage2PC request) {
         String txId = request.getTransactionId();
-        logger.info("COMMIT received for txId={}", txId);
+        logger.info("COMMIT received for txId={}, type={}, customerId={}, amount={}",
+                   txId, request.getTxType(), request.getCustomerId(), request.getAmount());
 
         PendingTransaction pending = pendingTransactions.remove(txId);
         if (pending == null) {
             logger.warn("No pending transaction found for commit: {}", txId);
+            // Still try to execute if we have details in the request
+            // This can happen in edge cases
+            if (request.getTxType() != null) {
+                executeTransaction(request.getTxType(), request.getCustomerId(), request.getAmount());
+            }
             return SmallBankMessage2PC.newAck(txId);
         }
 
-        // Apply the computed changes
-        for (Map.Entry<Long, Double> entry : pending.newCheckingBalances.entrySet()) {
-            checking.put(entry.getKey(), entry.getValue());
-        }
-        for (Map.Entry<Long, Double> entry : pending.newSavingsBalances.entrySet()) {
-            savings.put(entry.getKey(), entry.getValue());
-        }
+        // Execute the actual transaction using details from the COMMIT message
+        // (or fall back to pending transaction details if not in COMMIT)
+        SmallBankMessage2PC.TransactionType txType = request.getTxType() != null
+            ? request.getTxType() : pending.txType;
+        long customerId = request.getCustomerId() > 0
+            ? request.getCustomerId() : pending.customerId;
+        double amount = request.getAmount() > 0
+            ? request.getAmount() : pending.amount;
+
+        executeTransaction(txType, customerId, amount);
 
         // Release locks
         releaseLocks(pending.lockedAccountIds);
 
         logger.info("COMMIT successful for txId={}", txId);
         return SmallBankMessage2PC.newAck(txId);
+    }
+
+    /**
+     * Execute the actual transaction (called during COMMIT phase).
+     */
+    private void executeTransaction(SmallBankMessage2PC.TransactionType txType,
+                                    long customerId, double amount) {
+        switch (txType) {
+            case DEPOSIT_CHECKING:
+                if (checking.containsKey(customerId)) {
+                    double balance = checking.get(customerId) + amount;
+                    checking.put(customerId, balance);
+                    logger.debug("DEPOSIT_CHECKING: {} += {} = {}", customerId, amount, balance);
+                }
+                break;
+
+            case WRITE_CHECK:
+                if (checking.containsKey(customerId)) {
+                    double balance = checking.get(customerId) - amount;
+                    checking.put(customerId, balance);
+                    logger.debug("WRITE_CHECK: {} -= {} = {}", customerId, amount, balance);
+                }
+                break;
+
+            case TRANSACT_SAVINGS:
+                if (savings.containsKey(customerId)) {
+                    double balance = savings.get(customerId) + amount;
+                    savings.put(customerId, balance);
+                    logger.debug("TRANSACT_SAVINGS: {} += {} = {}", customerId, amount, balance);
+                }
+                break;
+
+            default:
+                logger.warn("Unsupported transaction type in commit: {}", txType);
+        }
     }
 
     /**
@@ -448,6 +561,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             } else {
                 // Failed to acquire lock - release all acquired locks
                 for (Long acquired : acquiredLocks) {
+                    logger.info("Releasing lock on account {} due to failure to acquire lock on account {}", acquired, accountId);
                     lockedAccounts.remove(acquired);
                 }
                 return false;
@@ -522,48 +636,6 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                 return "Unsupported transaction type for 2PC: " + request.getTxType();
         }
 
-        return null; // Valid
-    }
-
-    /**
-     * Compute the changes that will be applied on commit.
-     * Also stores original values for potential rollback.
-     */
-    private void computeTransactionChanges(SmallBankMessage2PC request, PendingTransaction pending) {
-        long custId = request.getCustomerId();
-
-        switch (request.getTxType()) {
-            case DEPOSIT_CHECKING:
-                pending.originalCheckingBalances.put(custId, checking.get(custId));
-                pending.newCheckingBalances.put(custId, checking.get(custId) + request.getAmount());
-                break;
-
-            case TRANSACT_SAVINGS:
-                pending.originalSavingsBalances.put(custId, savings.get(custId));
-                pending.newSavingsBalances.put(custId, savings.get(custId) + request.getAmount());
-                break;
-
-            case WRITE_CHECK:
-                pending.originalCheckingBalances.put(custId, checking.get(custId));
-                pending.newCheckingBalances.put(custId, checking.get(custId) - request.getAmount());
-                break;
-
-            case SEND_PAYMENT:
-                long destId = request.getDestCustomerId();
-                pending.originalCheckingBalances.put(custId, checking.get(custId));
-                pending.originalCheckingBalances.put(destId, checking.get(destId));
-                pending.newCheckingBalances.put(custId, checking.get(custId) - request.getAmount());
-                pending.newCheckingBalances.put(destId, checking.get(destId) + request.getAmount());
-                break;
-
-            case AMALGAMATE:
-                long custId2 = request.getDestCustomerId();
-                double amountToTransfer = checking.get(custId2);
-                pending.originalCheckingBalances.put(custId2, checking.get(custId2));
-                pending.originalSavingsBalances.put(custId, savings.get(custId));
-                pending.newCheckingBalances.put(custId2, 0.0);
-                pending.newSavingsBalances.put(custId, savings.get(custId) + amountToTransfer);
-                break;
-        }
+        return null;
     }
 }
