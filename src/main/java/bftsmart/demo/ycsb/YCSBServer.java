@@ -24,11 +24,9 @@ import java.io.ObjectOutput;
 import java.io.ObjectOutputStream;
 import java.util.TreeMap;
 
-// import bftsmart.rlrpc.Prediction;
 import bftsmart.tom.MessageContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultRecoverable;
-import bftsmart.tom.util.Storage;
 
 /**
  *
@@ -42,12 +40,6 @@ public class YCSBServer extends DefaultRecoverable {
 
     private boolean logPrinted = false;
 
-    /* Adaptive timers */
-    private Storage consensusLatency = null;
-    private int interval;
-    private int iterations = 0;
-    private ServiceReplica replica;
-
     public static void main(String[] args) throws Exception {
         if (args.length == 1) {
             new YCSBServer(Integer.parseInt(args[0]));
@@ -58,9 +50,7 @@ public class YCSBServer extends DefaultRecoverable {
 
     private YCSBServer(int id) {
         this.mTables = new TreeMap<>();
-        this.interval = 10;
-        this.consensusLatency = new Storage(this.interval);
-        replica = new ServiceReplica(id, this, this);
+        new ServiceReplica(id, this, this);
     }
 
     @Override
@@ -74,28 +64,6 @@ public class YCSBServer extends DefaultRecoverable {
             } else {
                 logPrinted = false;
             }
-
-            /* Adaptive Timers */
-            iterations++;
-            if (msgCtx != null && msgCtx[index].getFirstInBatch() != null) {
-                consensusLatency.store(msgCtx[index].getFirstInBatch().decisionTime - msgCtx[index].getFirstInBatch().consensusStartTime);
-            }
-
-            // if (iterations % interval == 0) {
-            //     Prediction prediction = this.replica.getLearningAgentClient()
-            //         .predict(
-            //             interval,
-            //             (float) consensusLatency.getAverage(false) / 1000000,
-            //             (float) consensusLatency.getMax(false) / 1000000,
-            //             (float) consensusLatency.getMin(false) / 1000000,
-            //             (float) consensusLatency.getDP(true) / 1000000
-            //         );
-            //     System.out.println("Prediction ID: " + prediction.getPredictionId());
-            //     System.out.println("Suggested timeout: " + 
-            //             prediction.getAction().getTimeoutMilliseconds() + " ms");
-            //     // replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
-            //     consensusLatency.reset();
-            // }
 
             YCSBMessage aRequest = YCSBMessage.getObject(command);
             YCSBMessage reply = YCSBMessage.newErrorMessage("");

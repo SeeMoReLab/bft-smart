@@ -1,6 +1,5 @@
 package bftsmart.benchmark;
 
-import bftsmart.injection.*;
 import bftsmart.tom.ServiceProxy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,15 +42,6 @@ public class ThroughputLatencyClient {
 			clients[i].start();
 			Thread.sleep(10);
 		}
-
-        try {
-            InjectionClient injectionClient = new InjectionClient(
-                    "config/injection.json", initialClientId + numClients);
-            injectionClient.start();
-        } catch (Exception ex) {
-            System.out.println("Could not load injection config " + ex.getMessage());
-        }
-
 
 		latch.await();
 		System.out.println("Executing experiment");
