@@ -1,13 +1,18 @@
 package bftsmart.demo.smallbank;
 
-// import bftsmart.rlrpc.Prediction;
+import bftsmart.rlrpc.LearningAgentGrpc;
+import bftsmart.rlrpc.Report;
+import bftsmart.rlrpc.ReportLocal;
 import bftsmart.tom.MessageContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultRecoverable;
 import bftsmart.tom.util.Storage;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 
 import java.io.*;
 import java.util.HashMap;
+import java.util.concurrent.TimeUnit;
 
 public class SmallBankServer extends DefaultRecoverable {
     private static final boolean _debug = false;
@@ -22,6 +27,8 @@ public class SmallBankServer extends DefaultRecoverable {
     private final int interval;
     private int iterations = 0;
     private ServiceReplica replica;
+    private ManagedChannel learnerChannel;
+    private LearningAgentGrpc.LearningAgentBlockingStub learnerStub;
 
     public static void main(String[] args) throws Exception {
         if (args.length == 1) {
@@ -38,6 +45,7 @@ public class SmallBankServer extends DefaultRecoverable {
         this.interval = 100;
         this.consensusLatency = new Storage(this.interval);
         replica = new ServiceReplica(id, this, this);
+        initLearningAgentClient();
     }
 
     @Override
@@ -58,25 +66,7 @@ public class SmallBankServer extends DefaultRecoverable {
                 consensusLatency.store(msgCtx[index].getFirstInBatch().decisionTime - msgCtx[index].getFirstInBatch().consensusStartTime);
             }
 
-            // if (iterations % interval == 0 && replica.getLearningAgentClient() != null) {
-            //     try {
-            //         Prediction prediction = this.replica.getLearningAgentClient()
-            //                 .predict(
-            //                         interval,
-            //                         (float) consensusLatency.getAverage(false) / 1000000,
-            //                         (float) consensusLatency.getMax(false) / 1000000,
-            //                         (float) consensusLatency.getMin(false) / 1000000,
-            //                         (float) consensusLatency.getDP(true) / 1000000
-            //                 );
-            //         System.out.println("Prediction ID: " + prediction.getPredictionId());
-            //         System.out.println("Suggested timeout: " +
-            //                 prediction.getAction().getTimeoutMilliseconds() + " ms");
-            //         replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
-            //         consensusLatency.reset();
-            //     } catch (Exception e) {
-            //         System.out.println("Exception in getting timeout from agent: " + e.getMessage());
-            //     }
-            // }
+            maybeSendReport(msgCtx != null ? msgCtx[index] : null);
 
             SmallBankMessage request = SmallBankMessage.getObject(command);
             SmallBankMessage reply = SmallBankMessage.newErrorMessage("Unknown error");
@@ -267,6 +257,59 @@ public class SmallBankServer extends DefaultRecoverable {
             System.err.println("[ERROR] Error serializing state: "
                     + ioe.getMessage());
             return "ERROR".getBytes();
+        }
+    }
+
+    private void initLearningAgentClient() {
+        int replicaId = replica.getReplicaContext().getStaticConfiguration().getProcessId();
+        String host = replica.getReplicaContext().getStaticConfiguration().getHost(replicaId);
+        int port = replica.getReplicaContext().getStaticConfiguration().getLearnerPort(replicaId);
+        if (port <= 0) {
+            System.out.println("Learner port not configured for replica " + replicaId + ". Reports will not be sent.");
+            return;
+        }
+        learnerChannel = ManagedChannelBuilder.forAddress(host, port)
+                .usePlaintext()
+                .build();
+        learnerStub = LearningAgentGrpc.newBlockingStub(learnerChannel);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                learnerChannel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }));
+    }
+
+    private void maybeSendReport(MessageContext msgCtx) {
+        if (learnerStub == null || iterations % interval != 0) {
+            return;
+        }
+        int sampleCount = consensusLatency.getCount();
+        if (sampleCount == 0) {
+            return;
+        }
+        int episode = msgCtx != null ? msgCtx.getConsensusId() : iterations / interval;
+
+        Report report = Report.newBuilder()
+                .setProcessedTransactions(sampleCount)
+                .setAvgMessageDelay((float) (consensusLatency.getAverage(false) / 1_000_000.0))
+                .setMaxMessageDelay((float) (consensusLatency.getMax(false) / 1_000_000.0))
+                .setMinMessageDelay((float) (consensusLatency.getMin(false) / 1_000_000.0))
+                .setStdMessageDelay((float) (consensusLatency.getDP(true) / 1_000_000.0))
+                .build();
+
+        ReportLocal local = ReportLocal.newBuilder()
+                .setNodeId(replica.getId())
+                .setEpisode(episode)
+                .setReport(report)
+                .build();
+
+        try {
+            learnerStub.sendReport(local);
+            consensusLatency.reset();
+        } catch (Exception e) {
+            System.out.println("Exception in sending report to agent: " + e.getMessage());
         }
     }
 }

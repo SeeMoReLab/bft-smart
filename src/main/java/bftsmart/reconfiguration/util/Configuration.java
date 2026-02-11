@@ -300,6 +300,10 @@ public class Configuration {
 		return hosts.getLearnerPort(id);
 	}
 
+	public final int getDataExchangePort(int id) {
+		return hosts.getDataExchangePort(id);
+	}
+
 	public final int getServerToServerPort(int id) {
 		return hosts.getServerToServerPort(id);
 	}

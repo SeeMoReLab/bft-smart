@@ -1,13 +1,16 @@
 package bftsmart.demo.dataexchange;
 
-import bftsmart.rlrpc.DataExchangeGrpc;
-import bftsmart.rlrpc.ReportShared;
+import bftsmart.rlrpc.ConsensusGrpc;
+import bftsmart.rlrpc.LearningAgentGrpc;
+import bftsmart.rlrpc.ReportBatch;
 import bftsmart.tom.MessageContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.core.messages.TOMMessage;
 import bftsmart.tom.core.messages.TOMMessageType;
 import bftsmart.tom.server.defaultservices.DefaultSingleRecoverable;
 import com.google.protobuf.Empty;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.stub.StreamObserver;
@@ -30,28 +33,54 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
     private final Server grpcServer;
     private final AtomicInteger sequence = new AtomicInteger(0);
     private final int senderId;
+    private final ManagedChannel learnerChannel;
+    private final LearningAgentGrpc.LearningAgentBlockingStub learnerStub;
+    private final String learnerHost;
+    private final int learnerPort;
+    private final int dataExchangePort;
 
     private volatile int lastEpisode = -1;
     private volatile long totalReports = 0;
 
-    public DataExchangeServer(int replicaId, int grpcPort) throws IOException {
+    public DataExchangeServer(int replicaId) throws IOException {
         this.replica = new ServiceReplica(replicaId, this, this);
         this.senderId = EPISODE_CLIENT_ID_BASE + replicaId;
+        this.learnerHost = replica.getReplicaContext().getStaticConfiguration().getHost(replicaId);
+        this.learnerPort = replica.getReplicaContext().getStaticConfiguration().getLearnerPort(replicaId);
+        this.dataExchangePort = replica.getReplicaContext().getStaticConfiguration().getDataExchangePort(replicaId);
+
+        if (dataExchangePort <= 0) {
+            throw new IllegalStateException(
+                    "Data exchange port not configured for replica " + replicaId + ". Cannot start DataExchange gRPC server.");
+        }
+
+        if (learnerPort > 0) {
+            this.learnerChannel = ManagedChannelBuilder.forAddress(learnerHost, learnerPort)
+                    .usePlaintext()
+                    .build();
+            this.learnerStub = LearningAgentGrpc.newBlockingStub(learnerChannel);
+            logger.info("LearningAgent client configured for {}:{}", learnerHost, learnerPort);
+        } else {
+            this.learnerChannel = null;
+            this.learnerStub = null;
+            logger.warn("Learner port not configured for replica {}. DeliverConsensus will be skipped.", replicaId);
+        }
 
         if (!replica.getReplicaContext().getStaticConfiguration().useEpisodeRequests()) {
             logger.warn("system.optimizations.episode_requests is disabled. Episode-based dedupe will not be active.");
         }
 
         if (replica.getReplicaContext().getStaticConfiguration().getUseSignatures() == 1) {
-            logger.warn("system.communication.useSignatures=1 is enabled. Episode requests are not signed and may be rejected.");
+            logger.warn(
+                    "system.communication.useSignatures=1 is enabled. Episode requests are not signed and may be rejected.");
         }
 
-        this.grpcServer = ServerBuilder.forPort(grpcPort)
-                .addService(new DataExchangeService(replica, senderId, sequence))
+        this.grpcServer = ServerBuilder.forPort(dataExchangePort)
+                .addService(new ConsensusService(replica, senderId, sequence))
                 .build()
                 .start();
 
-        logger.info("DataExchange gRPC server started on port {} (replica {})", grpcPort, replicaId);
+        logger.info("DataExchange gRPC server started on port {} (replica {})", dataExchangePort, replicaId);
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
@@ -63,32 +92,35 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length < 2) {
-            System.out.println("Usage: demo.dataexchange.DataExchangeServer <replica_id> <grpc_port>");
+        if (args.length < 1) {
+            System.out.println("Usage: demo.dataexchange.DataExchangeServer <replica_id>");
             System.exit(-1);
         }
 
         int replicaId = Integer.parseInt(args[0]);
-        int grpcPort = Integer.parseInt(args[1]);
-        new DataExchangeServer(replicaId, grpcPort);
+        new DataExchangeServer(replicaId);
     }
 
     private void shutdown() throws InterruptedException {
         grpcServer.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+        if (learnerChannel != null) {
+            learnerChannel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+        }
     }
 
     @Override
     public byte[] appExecuteOrdered(byte[] command, MessageContext msgCtx) {
         try {
-            ReportShared shared = ReportShared.parseFrom(command);
-            logger.info("Executing ordered ReportShared episode {} with {} reports: {}",
-                    shared.getEpisode(), shared.getReportsCount(), shared);
-            lastEpisode = shared.getEpisode();
-            totalReports += shared.getReportsCount();
+            ReportBatch batch = ReportBatch.parseFrom(command);
+            logger.info("Executing ordered ReportBatch episode {} with {} reports: {}",
+                    batch.getEpisode(), batch.getReportsCount(), batch);
+            lastEpisode = batch.getEpisode();
+            totalReports += batch.getReportsCount();
             logger.info("Ordered episode {} with {} reports (totalReports={})",
-                    shared.getEpisode(), shared.getReportsCount(), totalReports);
+                    batch.getEpisode(), batch.getReportsCount(), totalReports);
+            deliverConsensus(batch);
         } catch (Exception e) {
-            logger.error("Failed to parse ReportShared", e);
+            logger.error("Failed to parse ReportBatch", e);
         }
         return new byte[0];
     }
@@ -101,7 +133,7 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
     @Override
     public byte[] getSnapshot() {
         try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
-             DataOutputStream dos = new DataOutputStream(baos)) {
+                DataOutputStream dos = new DataOutputStream(baos)) {
             dos.writeInt(lastEpisode);
             dos.writeLong(totalReports);
             dos.flush();
@@ -118,7 +150,7 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
             return;
         }
         try (ByteArrayInputStream bais = new ByteArrayInputStream(state);
-             DataInputStream dis = new DataInputStream(bais)) {
+                DataInputStream dis = new DataInputStream(bais)) {
             lastEpisode = dis.readInt();
             totalReports = dis.readLong();
         } catch (IOException e) {
@@ -126,21 +158,21 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
         }
     }
 
-    private static final class DataExchangeService extends DataExchangeGrpc.DataExchangeImplBase {
+    private static final class ConsensusService extends ConsensusGrpc.ConsensusImplBase {
         private final ServiceReplica replica;
         private final int senderId;
         private final AtomicInteger sequence;
 
-        private DataExchangeService(ServiceReplica replica, int senderId, AtomicInteger sequence) {
+        private ConsensusService(ServiceReplica replica, int senderId, AtomicInteger sequence) {
             this.replica = replica;
             this.senderId = senderId;
             this.sequence = sequence;
         }
 
         @Override
-        public void exchangeData(ReportShared request, StreamObserver<Empty> responseObserver) {
+        public void submitReportBatch(ReportBatch request, StreamObserver<Empty> responseObserver) {
             try {
-                logger.info("Received gRPC ReportShared episode {} with {} reports: {}",
+                logger.info("Received gRPC ReportBatch episode {} with {} reports: {}",
                         request.getEpisode(), request.getReportsCount(), request);
                 TOMMessage message = buildMessage(request);
                 replica.submitClientRequest(message);
@@ -151,7 +183,7 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
             }
         }
 
-        private TOMMessage buildMessage(ReportShared request) {
+        private TOMMessage buildMessage(ReportBatch request) {
             int seq = sequence.getAndIncrement();
             int session = 0;
             int episode = request.getEpisode();
@@ -160,6 +192,20 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
                     request.toByteArray(), viewId, TOMMessageType.ORDERED_REQUEST);
             message.serializedMessage = TOMMessage.messageToBytes(message);
             return message;
+        }
+    }
+
+    private void deliverConsensus(ReportBatch batch) {
+        if (learnerStub == null) {
+            return;
+        }
+        try {
+            learnerStub.deliverConsensus(batch);
+            logger.info("Delivered consensus ReportBatch episode {} to learner {}:{}",
+                    batch.getEpisode(), learnerHost, learnerPort);
+        } catch (Exception e) {
+            logger.warn("Failed to deliver consensus ReportBatch episode {} to learner {}:{}",
+                    batch.getEpisode(), learnerHost, learnerPort, e);
         }
     }
 }
