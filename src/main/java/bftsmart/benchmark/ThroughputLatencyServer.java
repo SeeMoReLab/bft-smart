@@ -1,11 +1,8 @@
 package bftsmart.benchmark;
 
-import bftsmart.rlrpc.Prediction;
 import bftsmart.tom.MessageContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultSingleRecoverable;
-import bftsmart.tom.util.Storage;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -23,10 +20,6 @@ public class ThroughputLatencyServer extends DefaultSingleRecoverable {
 	private long numRequests;
 	private final Set<Integer> senders;
 	private double maxThroughput;
-	private ServiceReplica replica;
-	private int iterations = 0;
-	private int interval = 100;
-	private Storage consensusLatency;
 
 	public static void main(String[] args) {
 		if (args.length != 2) {
@@ -44,31 +37,11 @@ public class ThroughputLatencyServer extends DefaultSingleRecoverable {
 		for (int i = 0; i < stateSize; i++) {
 			state[i] = (byte) i;
 		}
-		consensusLatency = new Storage(interval);
-		replica = new ServiceReplica(processId, this, this);
+		new ServiceReplica(processId, this, this);
 	}
 
 	@Override
 	public byte[] appExecuteOrdered(byte[] command, MessageContext msgCtx) {
-		iterations++;
-		consensusLatency.store(msgCtx.getFirstInBatch().decisionTime - msgCtx.getFirstInBatch().consensusStartTime);
-//		if (iterations % interval == 0) {
-//			if (this.replica.getLearningAgentClient() != null) {
-//                Prediction prediction = this.replica.getLearningAgentClient()
-//                    .predict(
-//                        interval,
-//                        (float) consensusLatency.getAverage(false) / 1000000,
-//                        (float) consensusLatency.getMax(false) / 1000000,
-//                        (float) consensusLatency.getMin(false) / 1000000,
-//                        (float) consensusLatency.getDP(false) / 1000000
-//                    );
-//                System.out.println("Prediction ID: " + prediction.getPredictionId());
-//                System.out.println("Suggested timeout: " +
-//                        prediction.getAction().getTimeoutMilliseconds() + " ms");
-//                replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
-//            }
-//			iterations = 0;
-//		}
 		return processRequest(msgCtx);
 	}
 
@@ -94,7 +67,6 @@ public class ThroughputLatencyServer extends DefaultSingleRecoverable {
 
 			//compute throughput
 			double throughput = numRequests / (delay / 1_000_000_000.0);
-			System.out.println("Throughput: " + throughput + " ops/s");
 			if (throughput > maxThroughput)
 				maxThroughput = throughput;
 			logger.info("(clients[#]|requests[#]|delta[ns]|throughput[ops/s], max[ops/s])>({}|{}|{}|{}|{})",

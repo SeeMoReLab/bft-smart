@@ -62,7 +62,7 @@ public class HostsConfig {
                         int portRR = Integer.valueOf(str.nextToken());
                         this.servers.put(id, new Config(id, host, port, portRR));
                     }
-                    /* Adaptive Timers */
+                    // Adaptive Timer
                     else if(str.countTokens() == 5){
                         int id = Integer.valueOf(str.nextToken());
                         String host = str.nextToken();
@@ -70,6 +70,15 @@ public class HostsConfig {
                         int portRR = Integer.valueOf(str.nextToken());
                         int learnerPort = Integer.valueOf(str.nextToken());
                         this.servers.put(id, new Config(id, host, port, portRR, learnerPort));
+                    // Data Exchange
+                    } else if (str.countTokens() == 6) {
+                        int id = Integer.valueOf(str.nextToken());
+                        String host = str.nextToken();
+                        int port = Integer.valueOf(str.nextToken());
+                        int portRR = Integer.valueOf(str.nextToken());
+                        int learnerPort = Integer.valueOf(str.nextToken());
+                        int dataExchangePort = Integer.valueOf(str.nextToken());
+                        this.servers.put(id, new Config(id, host, port, portRR, learnerPort, dataExchangePort));
                     }
                 }
             }
@@ -120,6 +129,14 @@ public class HostsConfig {
         Config c = (Config) this.servers.get(id);
         if(c != null){
             return c.learnerPort;
+        }
+        return -1;
+    }
+
+    public int getDataExchangePort(int id) {
+        Config c = (Config) this.servers.get(id);
+        if (c != null) {
+            return c.dataExchangePort;
         }
         return -1;
     }
@@ -178,6 +195,7 @@ public class HostsConfig {
         public int port;
         public int portRR;
         public int learnerPort;
+        public int dataExchangePort;
 
         public Config(int id, String host, int port, int portRR, int learnerPort){
             this.id = id;
@@ -185,6 +203,7 @@ public class HostsConfig {
             this.port = port;
             this.portRR = portRR;
             this.learnerPort = learnerPort;
+            this.dataExchangePort = -1;
         }
 
         public Config(int id, String host, int port, int portRR){
@@ -192,6 +211,17 @@ public class HostsConfig {
             this.host = host;
             this.port = port;
             this.portRR = portRR;
+            this.learnerPort = -1;
+            this.dataExchangePort = -1;
+        }
+
+        public Config(int id, String host, int port, int portRR, int learnerPort, int dataExchangePort){
+            this.id = id;
+            this.host = host;
+            this.port = port;
+            this.portRR = portRR;
+            this.learnerPort = learnerPort;
+            this.dataExchangePort = dataExchangePort;
         }
     }
 }

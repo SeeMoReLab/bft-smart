@@ -32,8 +32,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import bftsmart.tom.core.messages.TOMMessageType;
 
 /**
  *
@@ -48,6 +51,11 @@ public class ClientsManager {
     private HashMap<Integer, ClientData> clientsData = new HashMap<Integer, ClientData>();
     private RequestVerifier verifier;
     private ServerCommunicationSystem cs;
+
+    private static final int DEFAULT_EPISODE_REPLY_WINDOW = 10000;
+    private final ConcurrentHashMap<Integer, Boolean> orderedEpisodes = new ConcurrentHashMap<>();
+    private final ConcurrentLinkedQueue<Integer> orderedEpisodesQueue = new ConcurrentLinkedQueue<>();
+    private final ConcurrentHashMap<Integer, TOMMessage> pendingByEpisode = new ConcurrentHashMap<>();
     
     //Used when the intention is to perform benchmarking with signature verification, but
     //without having to make the clients create one first. Useful to optimize resources
@@ -70,6 +78,16 @@ public class ClientsManager {
             benchSig = TOMUtil.signMessage(controller.getStaticConf().getPrivateKey(), benchMsg);            
         }
         startTime = System.currentTimeMillis() / 1000L ;
+    }
+
+    private Integer episodeKey(TOMMessage request) {
+        if (!controller.getStaticConf().useEpisodeRequests()) {
+            return null;
+        }
+        if (request.getReqType() != TOMMessageType.ORDERED_REQUEST) {
+            return null;
+        }
+        return request.getOperationId();
     }
 
     /**
@@ -307,6 +325,7 @@ public class ClientsManager {
         boolean accounted = false;
 
         ClientData clientData = getClientData(clientId);
+        Integer episode = episodeKey(request);
         
         if(request.getSequence() < 0) {
             //Do not accept this faulty message. -1 is the initial value which will bypass the sequence-checking further down in the function
@@ -401,7 +420,26 @@ public class ClientsManager {
                 //insert it in the pending requests of this client
 
                 request.recvFromClient = fromClient;
-                clientData.getPendingRequests().add(request); 
+
+                if (episode != null) {
+                    if (orderedEpisodes.containsKey(episode)) {
+                        clientData.setLastMessageReceived(request.getSequence());
+                        clientData.setLastMessageReceivedTime(request.receptionTime);
+                        clientData.clientLock.unlock();
+                        logger.debug("Dropping already ordered episode {} from client {}", episode, clientId);
+                        return false;
+                    }
+                    TOMMessage existing = pendingByEpisode.putIfAbsent(episode, request);
+                    if (existing != null) {
+                        clientData.setLastMessageReceived(request.getSequence());
+                        clientData.setLastMessageReceivedTime(request.receptionTime);
+                        clientData.clientLock.unlock();
+                        logger.debug("Dropping duplicate episode {} from client {}", episode, clientId);
+                        return false;
+                    }
+                }
+
+                clientData.getPendingRequests().add(request);
                 clientData.setLastMessageReceived(request.getSequence());
                 clientData.setLastMessageReceivedTime(request.receptionTime);
 
@@ -457,13 +495,17 @@ public class ClientsManager {
      * Caller must call lock() and unlock() on clientData.clientLock
      * @param clientData the clientData associated with the client
      */
-	private void clearPendingRequests(ClientData clientData) {
+    private void clearPendingRequests(ClientData clientData) {
         for(TOMMessage m : clientData.getPendingRequests()) {
             if(timer != null) {
                 //Clear all pending timers before clearing the requests. (For synchronous closed-loop clients there are never pending requests.)
                 //Without clearing the timer a leader change would be triggered, because the removed request will never be processed.
                 timer.unwatch(m);
-	        }
+            }
+            Integer episode = episodeKey(m);
+            if (episode != null) {
+                pendingByEpisode.remove(episode);
+            }
 	    }
         clientData.getPendingRequests().clear();
 	}
@@ -541,6 +583,47 @@ public class ClientsManager {
 
         /******* END CLIENTDATA CRITICAL SECTION ******/
         clientData.clientLock.unlock();
+
+        Integer episode = episodeKey(request);
+        if (episode != null) {
+            removePendingByEpisode(episode);
+            pendingByEpisode.remove(episode);
+            orderedEpisodes.put(episode, Boolean.TRUE);
+            orderedEpisodesQueue.add(episode);
+            trimOrderedEpisodes();
+        }
+    }
+
+    private void removePendingByEpisode(int episode) {
+        for (ClientData clientData : clientsData.values()) {
+            clientData.clientLock.lock();
+            try {
+                Iterator<TOMMessage> it = clientData.getPendingRequests().iterator();
+                while (it.hasNext()) {
+                    TOMMessage msg = it.next();
+                    Integer msgEpisode = episodeKey(msg);
+                    if (msgEpisode != null && msgEpisode == episode) {
+                        if (timer != null) {
+                            timer.unwatch(msg);
+                        }
+                        pendingByEpisode.remove(episode);
+                        it.remove();
+                    }
+                }
+            } finally {
+                clientData.clientLock.unlock();
+            }
+        }
+    }
+
+    private void trimOrderedEpisodes() {
+        while (orderedEpisodesQueue.size() > DEFAULT_EPISODE_REPLY_WINDOW) {
+            Integer evicted = orderedEpisodesQueue.poll();
+            if (evicted == null) {
+                return;
+            }
+            orderedEpisodes.remove(evicted);
+        }
     }
 
     public ReentrantLock getClientsLock() {

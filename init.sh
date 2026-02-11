@@ -46,7 +46,7 @@ REPLICA_DIR="$(cd "$PROJECT_DIR/replica0" && pwd)"
 sleep 7s
 osascript <<EOF
 tell application "Terminal"
-    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.demo.smallbank.SmallBankClient -c config/smallbank_config.xml --create --execute --inject"
+    do script "cd '$REPLICA_DIR' && ./smartrun.sh bftsmart.demo.smallbank.SmallBankClient -c config/smallbank_config.xml --create --execute"
 end tell
 EOF
 

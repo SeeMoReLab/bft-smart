@@ -1,17 +1,22 @@
 package bftsmart.demo.smallbank2pc;
 
-import bftsmart.rlrpc.Prediction;
+import bftsmart.rlrpc.LearningAgentGrpc;
+import bftsmart.rlrpc.Report;
+import bftsmart.rlrpc.ReportLocal;
 import bftsmart.tom.MessageContext;
 import bftsmart.tom.ReplicaContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultRecoverable;
 import bftsmart.tom.util.Storage;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 public class SmallBankServer2PC extends DefaultRecoverable {
     private static final Logger logger = LoggerFactory.getLogger(SmallBankServer2PC.class);
@@ -33,6 +38,8 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     private final int interval;
     private int iterations = 0;
     private ServiceReplica replica;
+    private ManagedChannel learnerChannel;
+    private LearningAgentGrpc.LearningAgentBlockingStub learnerStub;
 
     // Shard configuration (for logging/debugging)
     private ReplicaContext replicaContext;
@@ -129,6 +136,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         this.replicaContext = ctx;
         this.myReplicaId = ctx.getSVController().getStaticConf().getProcessId();
         logger.info("ReplicaContext set: shardId={}, replicaId={}", myShardId, myReplicaId);
+        initLearningAgentClient();
     }
 
     @Override
@@ -148,30 +156,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             if (msgCtx != null && msgCtx[index].getFirstInBatch() != null) {
                 consensusLatency.store(msgCtx[index].getFirstInBatch().decisionTime - msgCtx[index].getFirstInBatch().consensusStartTime);
             }
-
-            if (iterations % interval == 0 && replica.getLearningAgentClient() != null) {
-                try {
-                    Prediction prediction = this.replica.getLearningAgentClient()
-                            .predict(
-                                    interval,
-                                    (float) consensusLatency.getAverage(false) / 1000000,
-                                    (float) consensusLatency.getMax(false) / 1000000,
-                                    (float) consensusLatency.getMin(false) / 1000000,
-                                    (float) consensusLatency.getDP(true) / 1000000
-                            );
-                    System.out.println("Prediction ID: " + prediction.getPredictionId());
-                    System.out.println("Suggested timeout: " +
-                            prediction.getAction().getTimeoutMilliseconds() + " ms");
-                    replica.getRequestsTimer().setShortTimeout(prediction.getAction().getTimeoutMilliseconds());
-
-                    // Setting 2PC timeout here
-                    // replica.getShardHandler().setTimeoutMs(prediction.getAction().getTimeoutMilliseconds());
-
-                    consensusLatency.reset();
-                } catch (Exception e) {
-                    System.out.println("Exception in getting timeout from agent: " + e.getMessage());
-                }
-            }
+            maybeSendReport(msgCtx != null ? msgCtx[index] : null);
 
             SmallBankMessage2PC request = SmallBankMessage2PC.getObject(command);
             SmallBankMessage2PC reply = SmallBankMessage2PC.newErrorMessage("Unknown error");
@@ -637,5 +622,61 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         }
 
         return null;
+    }
+
+    private void initLearningAgentClient() {
+        if (learnerStub != null || replicaContext == null) {
+            return;
+        }
+        String host = replicaContext.getSVController().getStaticConf().getHost(myReplicaId);
+        int port = replicaContext.getSVController().getStaticConf().getLearnerPort(myReplicaId);
+        if (port <= 0) {
+            logger.warn("Learner port not configured for replica {}. Reports will not be sent.", myReplicaId);
+            return;
+        }
+        learnerChannel = ManagedChannelBuilder.forAddress(host, port)
+                .usePlaintext()
+                .build();
+        learnerStub = LearningAgentGrpc.newBlockingStub(learnerChannel);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                learnerChannel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }));
+        logger.info("LearningAgent client configured for {}:{}", host, port);
+    }
+
+    private void maybeSendReport(MessageContext msgCtx) {
+        if (learnerStub == null || iterations % interval != 0) {
+            return;
+        }
+        int sampleCount = consensusLatency.getCount();
+        if (sampleCount == 0) {
+            return;
+        }
+        int episode = msgCtx != null ? msgCtx.getConsensusId() : iterations / interval;
+
+        Report report = Report.newBuilder()
+                .setProcessedTransactions(sampleCount)
+                .setAvgMessageDelay((float) (consensusLatency.getAverage(false) / 1_000_000.0))
+                .setMaxMessageDelay((float) (consensusLatency.getMax(false) / 1_000_000.0))
+                .setMinMessageDelay((float) (consensusLatency.getMin(false) / 1_000_000.0))
+                .setStdMessageDelay((float) (consensusLatency.getDP(true) / 1_000_000.0))
+                .build();
+
+        ReportLocal local = ReportLocal.newBuilder()
+                .setNodeId(myReplicaId)
+                .setEpisode(episode)
+                .setReport(report)
+                .build();
+
+        try {
+            learnerStub.sendReport(local);
+            consensusLatency.reset();
+        } catch (Exception e) {
+            logger.warn("Exception in sending report to agent: {}", e.getMessage());
+        }
     }
 }

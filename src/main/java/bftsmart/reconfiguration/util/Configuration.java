@@ -70,6 +70,7 @@ public class Configuration {
 	protected boolean defaultKeys = false;
 
 	protected boolean useReadOnlyRequests;
+	protected boolean useEpisodeRequests;
 
 	public Configuration(int procId, KeyLoader loader) {
 		logger = LoggerFactory.getLogger(this.getClass());
@@ -170,6 +171,13 @@ public class Configuration {
 				useReadOnlyRequests = (s.equalsIgnoreCase("true"));
 			}
 
+			s = (String) configs.remove("system.optimizations.episode_requests");
+			if (s == null) {
+				useEpisodeRequests = false;
+			} else {
+				useEpisodeRequests = (s.equalsIgnoreCase("true"));
+			}
+
 			if (keyLoader == null) {
 				switch (defaultKeyLoader) {
 				case "RSA":
@@ -217,6 +225,10 @@ public class Configuration {
 
 	public final boolean useBlockingChannels() {
 		return this.channelsBlocking;
+	}
+
+	public final boolean useEpisodeRequests() {
+		return this.useEpisodeRequests;
 	}
 
 	public final boolean useReadOnlyRequests() {
@@ -286,6 +298,10 @@ public class Configuration {
 	/* Adaptive Timers */
 	public final int getLearnerPort(int id) {
 		return hosts.getLearnerPort(id);
+	}
+
+	public final int getDataExchangePort(int id) {
+		return hosts.getDataExchangePort(id);
 	}
 
 	public final int getServerToServerPort(int id) {
