@@ -126,6 +126,43 @@ public class ServiceReplica {
     }
 
     /**
+     * Constructor for sharded replica.
+     *
+     * @param shardId   Shard ID
+     * @param id        Replica ID within the shard
+     * @param executor  Executor
+     * @param recoverer Recoverer
+     */
+    public ServiceReplica(int shardId, int id, Executable executor, Recoverable recoverer) {
+        // Derive config path from shard/replica IDs
+        // this(shardId, id, "shard" + shardId + "/replica" + id + "/config", executor, recoverer);
+        this(shardId, id, "", executor, recoverer);
+    }
+
+    /**
+     * Constructor for sharded replica with explicit config path.
+     *
+     * @param shardId    Shard ID
+     * @param id         Replica ID within the shard
+     * @param configHome Path to configuration directory
+     * @param executor   Executor
+     * @param recoverer  Recoverer
+     */
+    public ServiceReplica(int shardId, int id, String configHome, Executable executor, Recoverable recoverer) {
+        this.id = id;
+        this.shardId = shardId;
+        this.configHome = configHome;
+        this.SVController = new ServerViewController(id, configHome, null);
+        this.executor = executor;
+        this.recoverer = recoverer;
+        this.replier = new DefaultReplier();
+        this.verifier = null;
+        this.init();
+        this.recoverer.setReplicaContext(replicaCtx);
+        this.replier.setReplicaContext(replicaCtx);
+    }
+
+    /**
      * Constructor
      *
      * @param id Replica ID

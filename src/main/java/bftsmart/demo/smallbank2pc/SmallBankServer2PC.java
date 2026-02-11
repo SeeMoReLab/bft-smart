@@ -151,6 +151,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                 logPrinted = false;
             }
 
+            /* Adaptive Timers */
             iterations++;
             if (msgCtx != null && msgCtx[index].getFirstInBatch() != null) {
                 consensusLatency.store(msgCtx[index].getFirstInBatch().decisionTime - msgCtx[index].getFirstInBatch().consensusStartTime);
