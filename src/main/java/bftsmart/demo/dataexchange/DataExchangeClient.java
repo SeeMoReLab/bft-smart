@@ -58,7 +58,7 @@ public class DataExchangeClient {
         return ReportLocal.newBuilder()
                 .setNodeId(nodeId)
                 .setEpisode(episode)
-                .setReport(randomReport())
+                .setState(randomReport())
                 .build();
     }
 

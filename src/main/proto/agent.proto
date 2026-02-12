@@ -18,8 +18,16 @@ message Report {
 message ReportLocal {
     uint32 node_id = 1;
     uint32 episode = 2;
-    Report report = 3;
-    bytes signature = 4;
+    Report state = 3;
+    optional Reward reward = 4;
+    bytes signature = 5;
+}
+
+// Reward for a prior episode, sent alongside the next report
+message Reward {
+    uint32 episode = 1;
+    Report report = 2;
+    int32 timeout_milliseconds_used = 3;
 }
 
 // Batch of signed reports submitted for consensus
