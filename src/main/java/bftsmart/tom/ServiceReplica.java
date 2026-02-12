@@ -85,46 +85,6 @@ public class ServiceReplica {
     private Replier replier = null;
     private RequestVerifier verifier = null;
 
-    // /* Adaptive Timers */
-    // private LearningAgentClient learningAgentClient = null;
-
-    /**
-     * Constructor for sharded replica.
-     *
-     * @param shardId   Shard ID
-     * @param id        Replica ID within the shard
-     * @param executor  Executor
-     * @param recoverer Recoverer
-     */
-    public ServiceReplica(int shardId, int id, Executable executor, Recoverable recoverer) {
-        // Derive config path from shard/replica IDs
-        // this(shardId, id, "shard" + shardId + "/replica" + id + "/config", executor, recoverer);
-        this(shardId, id, "", executor, recoverer);
-    }
-
-    /**
-     * Constructor for sharded replica with explicit config path.
-     *
-     * @param shardId    Shard ID
-     * @param id         Replica ID within the shard
-     * @param configHome Path to configuration directory
-     * @param executor   Executor
-     * @param recoverer  Recoverer
-     */
-    public ServiceReplica(int shardId, int id, String configHome, Executable executor, Recoverable recoverer) {
-        this.id = id;
-        this.shardId = shardId;
-        this.configHome = configHome;
-        this.SVController = new ServerViewController(id, configHome, null);
-        this.executor = executor;
-        this.recoverer = recoverer;
-        this.replier = new DefaultReplier();
-        this.verifier = null;
-        this.init();
-        this.recoverer.setReplicaContext(replicaCtx);
-        this.replier.setReplicaContext(replicaCtx);
-    }
-
     /**
      * Constructor for sharded replica.
      *
@@ -233,22 +193,6 @@ public class ServiceReplica {
             logger.error("Failed to initialize replica-to-replica communication system", ex);
             throw new RuntimeException("Unable to build a communication system.");
         }
-
-        // /* Adaptive timers */
-        // try {
-        //     String host = this.SVController.getStaticConf().getHost(this.id);
-        //     int learnerPort = this.SVController.getStaticConf().getLearnerPort(this.id);
-        //     if (learnerPort > 0) {
-        //         this.learningAgentClient = new LearningAgentClient(host, learnerPort);
-        //         System.out.println("Created learner client: " + host + " " + learnerPort);
-        //     } else {
-        //         System.out.println("Could not create learner client. LearnerPort is " + learnerPort);
-        //     }
-            
-        // } catch (Exception ex){
-        //     logger.error("Failed to initialize learning agent client", ex);
-        //     throw new RuntimeException("Unable to build learning agent client.");
-        // }
 
         if (this.SVController.isInCurrentView()) {
             logger.info("In current view: " + this.SVController.getCurrentView());
@@ -632,13 +576,6 @@ public class ServiceReplica {
         }
         return null;
     }
-
-    // /* Adaptive Timers */
-    // /**
-    //  * Learning Agent's gRPC client */
-    // public LearningAgentClient getLearningAgentClient() {
-    //     return learningAgentClient;
-    // }
 
     public RequestsTimer getRequestsTimer() {
         return tomLayer.requestsTimer;
