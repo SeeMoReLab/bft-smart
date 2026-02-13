@@ -98,13 +98,23 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         if (args.length == 2) {
             new SmallBankServer2PC(Integer.parseInt(args[0]), Integer.parseInt(args[1]));
         } else if (args.length == 3) {
-            // Usage with total shards specified
-            new SmallBankServer2PC(
-                    Integer.parseInt(args[0]),  // shardId
-                    Integer.parseInt(args[1]),  // replicaId
-                    Integer.parseInt(args[2]),  // totalShards
-                    null                         // configHome (use default)
-            );
+            if (isInteger(args[2])) {
+                // Usage with total shards specified
+                new SmallBankServer2PC(
+                        Integer.parseInt(args[0]),  // shardId
+                        Integer.parseInt(args[1]),  // replicaId
+                        Integer.parseInt(args[2]),  // totalShards
+                        null                         // configHome (use default)
+                );
+            } else {
+                // Usage with config home (default totalShards=1)
+                new SmallBankServer2PC(
+                        Integer.parseInt(args[0]),  // shardId
+                        Integer.parseInt(args[1]),  // replicaId
+                        1,                           // totalShards
+                        args[2]                      // configHome
+                );
+            }
         } else if (args.length == 4) {
             // Usage with total shards and config home
             new SmallBankServer2PC(
@@ -114,7 +124,16 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                     args[3]                      // configHome
             );
         } else {
-            System.out.println("Usage: java ... SmallBankServer2PC <shard_id> <replica_id> [<total_shards> [<config_home>]]");
+            System.out.println("Usage: java ... SmallBankServer2PC <shard_id> <replica_id> [<total_shards>|<config_home>] [<config_home>]");
+        }
+    }
+
+    private static boolean isInteger(String value) {
+        try {
+            Integer.parseInt(value);
+            return true;
+        } catch (NumberFormatException ignored) {
+            return false;
         }
     }
 

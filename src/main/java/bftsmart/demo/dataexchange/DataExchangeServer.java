@@ -43,7 +43,15 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
     private volatile long totalReports = 0;
 
     public DataExchangeServer(int replicaId) throws IOException {
-        this.replica = new ServiceReplica(replicaId, this, this);
+        this(replicaId, null);
+    }
+
+    public DataExchangeServer(int replicaId, String configHome) throws IOException {
+        if (configHome == null) {
+            this.replica = new ServiceReplica(replicaId, this, this);
+        } else {
+            this.replica = new ServiceReplica(replicaId, configHome, this, this, null, null, null);
+        }
         this.senderId = EPISODE_CLIENT_ID_BASE + replicaId;
         this.learnerHost = replica.getReplicaContext().getStaticConfiguration().getHost(replicaId);
         this.learnerPort = replica.getReplicaContext().getStaticConfiguration().getLearnerPort(replicaId);
@@ -93,12 +101,13 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 1) {
-            System.out.println("Usage: demo.dataexchange.DataExchangeServer <replica_id>");
+            System.out.println("Usage: demo.dataexchange.DataExchangeServer <replica_id> [<config_home>]");
             System.exit(-1);
         }
 
         int replicaId = Integer.parseInt(args[0]);
-        new DataExchangeServer(replicaId);
+        String configHome = (args.length > 1) ? args[1] : null;
+        new DataExchangeServer(replicaId, configHome);
     }
 
     private void shutdown() throws InterruptedException {

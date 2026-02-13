@@ -51,17 +51,27 @@ public class SmallBankServer extends DefaultRecoverable {
     public static void main(String[] args) throws Exception {
         if (args.length == 1) {
             new SmallBankServer(Integer.parseInt(args[0]));
+        } else if (args.length == 2) {
+            new SmallBankServer(Integer.parseInt(args[0]), args[1]);
         } else {
-            System.out.println("Usage: java ... SmallBankServer <replica_id>");
+            System.out.println("Usage: java ... SmallBankServer <replica_id> [<config_home>]");
         }
     }
 
     private SmallBankServer(int id) {
+        this(id, null);
+    }
+
+    private SmallBankServer(int id, String configHome) {
         this.accounts = new HashMap<>();
         this.checking = new HashMap<>();
         this.savings = new HashMap<>();
         this.consensusLatency = new Storage(EPISODE_LENGTH);
-        replica = new ServiceReplica(id, this, this);
+        if (configHome == null) {
+            replica = new ServiceReplica(id, this, this);
+        } else {
+            replica = new ServiceReplica(id, configHome, this, this, null, null, null);
+        }
         initLearningAgentClient();
         this.currentTimeoutMs = replica.getReplicaContext().getStaticConfiguration().getRequestTimeout();
         this.lastTimeoutUsedMs = currentTimeoutMs;
