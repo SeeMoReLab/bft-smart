@@ -14,6 +14,9 @@ import org.apache.commons.configuration2.tree.xpath.XPathExpressionEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -30,6 +33,9 @@ import java.util.concurrent.atomic.AtomicLong;
 public class SmallBankClient2PC {
     private static final Logger LOG = LoggerFactory.getLogger(SmallBankClient2PC.class);
     private static final String SINGLE_LINE = "======================================================================";
+    private static final String DEFAULT_CONFIG_HOME = "config";
+    private static final String WORKLOAD_FILE_NAME = "smallbank.xml";
+    private static final String LEGACY_WORKLOAD_FILE_NAME = "smallbank_config.xml";
 
     // Client configuration
     private final int clientId;
@@ -56,19 +62,27 @@ public class SmallBankClient2PC {
             Options options = buildOptions();
             CommandLine argsLine = parser.parse(options, args);
 
-            if (argsLine.hasOption("h") || !argsLine.hasOption("c")) {
+            if (argsLine.hasOption("h")) {
                 printUsage(options);
                 return;
             }
 
-            String configFile = argsLine.getOptionValue("c");
+            List<String> positionalArgs = argsLine.getArgList();
+            if (positionalArgs.size() > 1) {
+                printUsage(options);
+                return;
+            }
+
+            String configHome = positionalArgs.isEmpty() ? null : positionalArgs.get(0);
+            String configFile = resolveWorkloadConfigFile(configHome);
             int clientId = Integer.parseInt(argsLine.getOptionValue("id", "0"));
             int numShards = Integer.parseInt(argsLine.getOptionValue("shards", "1"));
             String shardConfigBase = argsLine.getOptionValue("shard-config", "");
 
             System.out.println(SINGLE_LINE);
             System.out.println("SmallBank BFT-SMaRt Client (2PC Enabled)");
-            System.out.println("Configuration: " + configFile);
+            System.out.println("Configuration home: " + defaultConfigHome(configHome));
+            System.out.println("Workload file: " + configFile);
             System.out.println("Client ID: " + clientId);
             System.out.println("Number of shards: " + numShards);
             if (!shardConfigBase.isEmpty()) {
@@ -532,9 +546,30 @@ public class SmallBankClient2PC {
         return builder.getConfiguration();
     }
 
+    private static String defaultConfigHome(String configHome) {
+        return (configHome == null || configHome.isBlank()) ? DEFAULT_CONFIG_HOME : configHome;
+    }
+
+    private static String resolveWorkloadConfigFile(String configHome) {
+        Path configDir = Paths.get(defaultConfigHome(configHome));
+        Path workloadFile = configDir.resolve(WORKLOAD_FILE_NAME);
+        if (Files.isRegularFile(workloadFile)) {
+            return workloadFile.toString();
+        }
+
+        Path legacyFile = configDir.resolve(LEGACY_WORKLOAD_FILE_NAME);
+        if (Files.isRegularFile(legacyFile)) {
+            System.out.printf(
+                    "Warning: workload file '%s' not found, falling back to '%s'%n",
+                    workloadFile, legacyFile);
+            return legacyFile.toString();
+        }
+
+        return workloadFile.toString();
+    }
+
     private static Options buildOptions() {
         Options options = new Options();
-        options.addOption("c", "config", true, "[required] Configuration file");
         options.addOption("id", "clientId", true, "Client ID for BFT-SMaRt proxy");
         options.addOption("s", "shards", true, "Number of shards (default: 1)");
         options.addOption(null, "shard-config", true, "Base path for shard configs");
@@ -547,12 +582,12 @@ public class SmallBankClient2PC {
 
     private static void printUsage(Options options) {
         HelpFormatter formatter = new HelpFormatter();
-        formatter.printHelp("SmallBankClient2PC", options);
+        formatter.printHelp("SmallBankClient2PC [config_home]", options);
         System.out.println("\nExamples:");
         System.out.println("  Single shard:");
-        System.out.println("    java ... SmallBankClient2PC -c config/smallbank.xml --create --execute");
+        System.out.println("    java ... SmallBankClient2PC --create --execute");
         System.out.println("\n  Multi-shard (2 shards):");
-        System.out.println("    java ... SmallBankClient2PC -c config/smallbank.xml -s 2 --create --execute");
+        System.out.println("    java ... SmallBankClient2PC config -s 2 --create --execute");
     }
 
     private static class WorkloadConfig {

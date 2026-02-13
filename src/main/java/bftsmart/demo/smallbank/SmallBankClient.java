@@ -16,6 +16,9 @@ import org.apache.commons.configuration2.tree.xpath.XPathExpressionEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -32,6 +35,9 @@ public class SmallBankClient {
 
     private static final String SINGLE_LINE = "======================================================================";
     private static final int MAX_LATENCY_MS = 10_000; // bucket upper bound; overflow latencies are clamped
+    private static final String DEFAULT_CONFIG_HOME = "config";
+    private static final String WORKLOAD_FILE_NAME = "smallbank.xml";
+    private static final String LEGACY_WORKLOAD_FILE_NAME = "smallbank_config.xml";
 
     private final ServiceProxy proxy;
     private final WorkloadConfig config;
@@ -46,22 +52,30 @@ public class SmallBankClient {
             Options options = buildOptions();
             CommandLine argsLine = parser.parse(options, args);
 
-            if (argsLine.hasOption("h") || !argsLine.hasOption("c")) {
+            if (argsLine.hasOption("h")) {
                 printUsage(options);
                 return;
             }
 
-            String configFile = argsLine.getOptionValue("c");
+            List<String> positionalArgs = argsLine.getArgList();
+            if (positionalArgs.size() > 1) {
+                printUsage(options);
+                return;
+            }
+
+            String configHome = positionalArgs.isEmpty() ? null : positionalArgs.get(0);
+            String configFile = resolveWorkloadConfigFile(configHome);
             int clientId = Integer.parseInt(argsLine.getOptionValue("id", "0"));
 
             System.out.println(SINGLE_LINE);
             System.out.println("SmallBank BFT-SMaRt Client");
-            System.out.println("Configuration: " + configFile);
+            System.out.println("Configuration home: " + defaultConfigHome(configHome));
+            System.out.println("Workload file: " + configFile);
             System.out.println("Client ID: " + clientId);
             System.out.println(SINGLE_LINE);
 
             WorkloadConfig config = loadConfiguration(configFile);
-            SmallBankClient client = new SmallBankClient(clientId, config);
+            SmallBankClient client = new SmallBankClient(clientId, config, configHome);
 
             if (argsLine.hasOption("create")) {
                 System.out.println("Creating accounts...");
@@ -96,9 +110,13 @@ public class SmallBankClient {
         }
     }
 
-    public SmallBankClient(int clientId, WorkloadConfig config) {
+    public SmallBankClient(int clientId, WorkloadConfig config, String configHome) {
         this.config = config;
-        this.proxy = new ServiceProxy(clientId);
+        if (configHome == null || configHome.isBlank()) {
+            this.proxy = new ServiceProxy(clientId);
+        } else {
+            this.proxy = new ServiceProxy(clientId, configHome);
+        }
         System.out.printf("Client %d initialized%n", clientId);
     }
 
@@ -526,9 +544,30 @@ public class SmallBankClient {
         return builder.getConfiguration();
     }
 
+    private static String defaultConfigHome(String configHome) {
+        return (configHome == null || configHome.isBlank()) ? DEFAULT_CONFIG_HOME : configHome;
+    }
+
+    private static String resolveWorkloadConfigFile(String configHome) {
+        Path configDir = Paths.get(defaultConfigHome(configHome));
+        Path workloadFile = configDir.resolve(WORKLOAD_FILE_NAME);
+        if (Files.isRegularFile(workloadFile)) {
+            return workloadFile.toString();
+        }
+
+        Path legacyFile = configDir.resolve(LEGACY_WORKLOAD_FILE_NAME);
+        if (Files.isRegularFile(legacyFile)) {
+            System.out.printf(
+                    "Warning: workload file '%s' not found, falling back to '%s'%n",
+                    workloadFile, legacyFile);
+            return legacyFile.toString();
+        }
+
+        return workloadFile.toString();
+    }
+
     private static Options buildOptions() {
         Options options = new Options();
-        options.addOption("c", "config", true, "[required] Configuration file");
         options.addOption("id", "clientId", true, "Client ID for BFT-SMaRt proxy");
         options.addOption(null, "create", false, "Create initial accounts");
         options.addOption(null, "execute", false, "Execute benchmark workload");
@@ -539,7 +578,10 @@ public class SmallBankClient {
 
     private static void printUsage(Options options) {
         HelpFormatter formatter = new HelpFormatter();
-        formatter.printHelp("SmallBankClient", options);
+        formatter.printHelp("SmallBankClient [config_home]", options);
+        System.out.println("\nExamples:");
+        System.out.println("  java ... SmallBankClient --create --execute");
+        System.out.println("  java ... SmallBankClient config --create --execute");
     }
 
     private static class WorkloadConfig {

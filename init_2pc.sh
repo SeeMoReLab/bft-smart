@@ -53,6 +53,6 @@ sleep 10s
 PROJECT_ABS_DIR="$(cd "$PROJECT_DIR" && pwd)"
 osascript <<EOF
 tell application "Terminal"
-    do script "cd '$PROJECT_ABS_DIR/shard0/replica0' && ./smartrun.sh bftsmart.demo.smallbank2pc.SmallBankClient2PC -c config/smallbank_config.xml -s $NUM_SHARDS --shard-config '$PROJECT_ABS_DIR' --create --execute"
+    do script "cd '$PROJECT_ABS_DIR/shard0/replica0' && ./smartrun.sh bftsmart.demo.smallbank2pc.SmallBankClient2PC config -s $NUM_SHARDS --shard-config '$PROJECT_ABS_DIR' --create --execute"
 end tell
 EOF
