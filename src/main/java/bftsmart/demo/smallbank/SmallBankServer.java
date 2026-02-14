@@ -113,7 +113,9 @@ public class SmallBankServer extends DefaultRecoverable {
             }
 
             SmallBankMessage request = SmallBankMessage.getObject(command);
-            SmallBankMessage reply = SmallBankMessage.newErrorMessage("Unknown error");
+            SmallBankMessage reply = SmallBankMessage.newErrorMessage(
+                    "Unknown error",
+                    SmallBankMessage.StatusCode.SYSTEM_ERROR);
 
             if (request == null) {
                 replies[index] = reply.getBytes();
@@ -130,7 +132,9 @@ public class SmallBankServer extends DefaultRecoverable {
 //                        System.out.println("[INFO] Creating account for " + request);
                         long custId = request.getCustomerId();
                         if (accounts.containsKey(custId)) {
-                            reply = SmallBankMessage.newErrorMessage("Account already exists");
+                            reply = SmallBankMessage.newErrorMessage(
+                                    "Account already exists",
+                                    SmallBankMessage.StatusCode.BUSINESS_ERROR);
                         } else {
                             accounts.put(custId, request.getCustomerName());
                             checking.put(custId, request.getCheckingBalance());
@@ -143,7 +147,9 @@ public class SmallBankServer extends DefaultRecoverable {
                     case DEPOSIT_CHECKING: {
                         long custId = request.getCustomerId();
                         if (!checking.containsKey(custId)) {
-                            reply = SmallBankMessage.newErrorMessage("Account not found");
+                            reply = SmallBankMessage.newErrorMessage(
+                                    "Account not found",
+                                    SmallBankMessage.StatusCode.BUSINESS_ERROR);
                         } else {
                             double balance = checking.get(custId) + request.getAmount();
                             checking.put(custId, balance);
@@ -155,11 +161,15 @@ public class SmallBankServer extends DefaultRecoverable {
                     case TRANSACT_SAVINGS: {
                         long custId = request.getCustomerId();
                         if (!savings.containsKey(custId)) {
-                            reply = SmallBankMessage.newErrorMessage("Account not found");
+                            reply = SmallBankMessage.newErrorMessage(
+                                    "Account not found",
+                                    SmallBankMessage.StatusCode.BUSINESS_ERROR);
                         } else {
                             double balance = savings.get(custId) + request.getAmount();
                             if (balance < 0) {
-                                reply = SmallBankMessage.newErrorMessage("Insufficient funds");
+                                reply = SmallBankMessage.newErrorMessage(
+                                        "Insufficient funds",
+                                        SmallBankMessage.StatusCode.INSUFFICIENT_FUNDS);
                             } else {
                                 savings.put(custId, balance);
                                 reply = SmallBankMessage.newResponse(0);
@@ -171,11 +181,15 @@ public class SmallBankServer extends DefaultRecoverable {
                     case WRITE_CHECK: {
                         long custId = request.getCustomerId();
                         if (!checking.containsKey(custId)) {
-                            reply = SmallBankMessage.newErrorMessage("Account not found");
+                            reply = SmallBankMessage.newErrorMessage(
+                                    "Account not found",
+                                    SmallBankMessage.StatusCode.BUSINESS_ERROR);
                         } else {
                             double balance = checking.get(custId) - request.getAmount();
                             if (balance < 0) {
-                                reply = SmallBankMessage.newErrorMessage("Insufficient funds");
+                                reply = SmallBankMessage.newErrorMessage(
+                                        "Insufficient funds",
+                                        SmallBankMessage.StatusCode.INSUFFICIENT_FUNDS);
                             } else {
                                 checking.put(custId, balance);
                                 reply = SmallBankMessage.newResponse(0);
@@ -189,13 +203,19 @@ public class SmallBankServer extends DefaultRecoverable {
                         long destId = request.getDestCustomerId();
 
                         if (!checking.containsKey(srcId)) {
-                            reply = SmallBankMessage.newErrorMessage("Source account not found");
+                            reply = SmallBankMessage.newErrorMessage(
+                                    "Source account not found",
+                                    SmallBankMessage.StatusCode.BUSINESS_ERROR);
                         } else if (!checking.containsKey(destId)) {
-                            reply = SmallBankMessage.newErrorMessage("Destination account not found");
+                            reply = SmallBankMessage.newErrorMessage(
+                                    "Destination account not found",
+                                    SmallBankMessage.StatusCode.BUSINESS_ERROR);
                         } else {
                             double srcBalance = checking.get(srcId) - request.getAmount();
                             if (srcBalance < 0) {
-                                reply = SmallBankMessage.newErrorMessage("Insufficient funds");
+                                reply = SmallBankMessage.newErrorMessage(
+                                        "Insufficient funds",
+                                        SmallBankMessage.StatusCode.INSUFFICIENT_FUNDS);
                             } else {
                                 double destBalance = checking.get(destId) + request.getAmount();
                                 checking.put(srcId, srcBalance);
@@ -211,9 +231,13 @@ public class SmallBankServer extends DefaultRecoverable {
                         long custId2 = request.getDestCustomerId();
 
                         if (!checking.containsKey(custId1) || !savings.containsKey(custId1)) {
-                            reply = SmallBankMessage.newErrorMessage("Account 1 not found");
+                            reply = SmallBankMessage.newErrorMessage(
+                                    "Account 1 not found",
+                                    SmallBankMessage.StatusCode.BUSINESS_ERROR);
                         } else if (!checking.containsKey(custId2) || !savings.containsKey(custId2)) {
-                            reply = SmallBankMessage.newErrorMessage("Account 2 not found");
+                            reply = SmallBankMessage.newErrorMessage(
+                                    "Account 2 not found",
+                                    SmallBankMessage.StatusCode.BUSINESS_ERROR);
                         } else {
                             // Transfer all from custId2's checking to custId1's savings
                             double amountToTransfer = checking.get(custId2);
@@ -225,11 +249,15 @@ public class SmallBankServer extends DefaultRecoverable {
                     }
 
                     default:
-                        reply = SmallBankMessage.newErrorMessage("Unknown operation type");
+                        reply = SmallBankMessage.newErrorMessage(
+                                "Unknown operation type",
+                                SmallBankMessage.StatusCode.BUSINESS_ERROR);
                         break;
                 }
             } catch (Exception e) {
-                reply = SmallBankMessage.newErrorMessage("Exception: " + e.getMessage());
+                reply = SmallBankMessage.newErrorMessage(
+                        "Exception: " + e.getMessage(),
+                        SmallBankMessage.StatusCode.SYSTEM_ERROR);
                 if (_debug) {
                     e.printStackTrace();
                 }
@@ -246,7 +274,9 @@ public class SmallBankServer extends DefaultRecoverable {
     @Override
     public byte[] appExecuteUnordered(byte[] command, MessageContext msgCtx) {
         SmallBankMessage request = SmallBankMessage.getObject(command);
-        SmallBankMessage reply = SmallBankMessage.newErrorMessage("Unknown error");
+        SmallBankMessage reply = SmallBankMessage.newErrorMessage(
+                "Unknown error",
+                SmallBankMessage.StatusCode.SYSTEM_ERROR);
 
         if (request == null) {
             return reply.getBytes();
@@ -256,7 +286,9 @@ public class SmallBankServer extends DefaultRecoverable {
             case BALANCE:
                 long custId = request.getCustomerId();
                 if (!checking.containsKey(custId) || !savings.containsKey(custId)) {
-                    reply = SmallBankMessage.newErrorMessage("Account not found");
+                    reply = SmallBankMessage.newErrorMessage(
+                            "Account not found",
+                            SmallBankMessage.StatusCode.BUSINESS_ERROR);
                 } else {
                     double checkingBalance = checking.get(custId);
                     double savingsBalance = savings.get(custId);

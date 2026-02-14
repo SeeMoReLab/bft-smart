@@ -39,7 +39,8 @@ public class SmallBankClient {
     private static final String WORKLOAD_FILE_NAME = "smallbank.xml";
     private static final String LEGACY_WORKLOAD_FILE_NAME = "smallbank_config.xml";
 
-    private final ServiceProxy proxy;
+    private final int clientBaseId;
+    private final String configHome;
     private final WorkloadConfig config;
     private final AtomicInteger successCount = new AtomicInteger(0);
     private final AtomicInteger errorCount = new AtomicInteger(0);
@@ -111,40 +112,38 @@ public class SmallBankClient {
     }
 
     public SmallBankClient(int clientId, WorkloadConfig config, String configHome) {
+        this.clientBaseId = clientId;
+        this.configHome = configHome;
         this.config = config;
-        if (configHome == null || configHome.isBlank()) {
-            this.proxy = new ServiceProxy(clientId);
-        } else {
-            this.proxy = new ServiceProxy(clientId, configHome);
-        }
         System.out.printf("Client %d initialized%n", clientId);
     }
 
     private void createAccounts() {
         logger.info("Creating {} accounts...", config.numAccounts);
         long startTime = System.currentTimeMillis();
+        try (ServiceProxy proxy = createProxy(clientBaseId)) {
+            for (long custId = 0; custId < config.numAccounts; custId++) {
+                String custName = String.format("Customer%010d", custId);
+                double savingsBalance = 10000.0;
+                double checkingBalance = 10000.0;
 
-        for (long custId = 0; custId < config.numAccounts; custId++) {
-            String custName = String.format("Customer%010d", custId);
-            double savingsBalance = 10000.0;
-            double checkingBalance = 10000.0;
+                SmallBankMessage msg = SmallBankMessage.newCreateAccountRequest(
+                        custId, custName, savingsBalance, checkingBalance);
 
-            SmallBankMessage msg = SmallBankMessage.newCreateAccountRequest(
-                    custId, custName, savingsBalance, checkingBalance);
+                try {
+                    byte[] reply = proxy.invokeOrdered(msg.getBytes());
+                    SmallBankMessage response = SmallBankMessage.getObject(reply);
 
-            try {
-                byte[] reply = proxy.invokeOrdered(msg.getBytes());
-                SmallBankMessage response = SmallBankMessage.getObject(reply);
-
-                if (response.getResult() != 0) {
-                    logger.error("Failed to create account {}: {}", custId, response.getErrorMsg());
+                    if (response.getResult() != 0) {
+                        logger.error("Failed to create account {}: {}", custId, response.getErrorMsg());
+                    }
+                } catch (Exception e) {
+                    logger.error("Error creating account {}", custId, e);
                 }
-            } catch (Exception e) {
-                logger.error("Error creating account {}", custId, e);
-            }
 
-            if ((custId + 1) % 1000 == 0) {
-                logger.info("Created {} accounts", custId + 1);
+                if ((custId + 1) % 1000 == 0) {
+                    logger.info("Created {} accounts", custId + 1);
+                }
             }
         }
 
@@ -165,7 +164,7 @@ public class SmallBankClient {
 
         for (int i = 0; i < maxTerminals; i++) {
             final int terminalId = i;
-            executor.submit(() -> runWorker(terminalId, windows, startLatch, phaseBarrier));
+            executor.submit(() -> runWorker(terminalId, windows, startLatch, phaseBarrier, createProxyId(terminalId)));
         }
 
         long workloadStart = System.nanoTime();
@@ -191,30 +190,33 @@ public class SmallBankClient {
         printResults("Total", (workloadEnd - workloadStart) / 1_000_000_000.0, overallDelta);
     }
 
-    private void runWorker(int terminalId, PhaseWindow[] windows, CountDownLatch startLatch, Phaser phaseBarrier) {
+    private void runWorker(int terminalId, PhaseWindow[] windows, CountDownLatch startLatch, Phaser phaseBarrier,
+            int proxyId) {
         try {
-            startLatch.await();
-            for (int phaseIdx = 0; phaseIdx < windows.length; phaseIdx++) {
-                PhaseWindow window = windows[phaseIdx];
-                boolean active = terminalId < window.terminals;
-                // Wait for phase start
-                while (System.nanoTime() < window.startNs) {
-                    Thread.sleep(1);
-                }
-                if (active) {
-                    runPhase(terminalId, phaseIdx, window);
-                } else {
-                    // Inactive terminals stay idle for this phase
-                    while (System.nanoTime() < window.endNs) {
-                        long remainingNs = window.endNs - System.nanoTime();
-                        if (remainingNs <= 0) {
-                            break;
-                        }
-                        long sleepMs = Math.min(TimeUnit.NANOSECONDS.toMillis(remainingNs), 100);
-                        Thread.sleep(Math.max(sleepMs, 1));
+            try (ServiceProxy proxy = createProxy(proxyId)) {
+                startLatch.await();
+                for (int phaseIdx = 0; phaseIdx < windows.length; phaseIdx++) {
+                    PhaseWindow window = windows[phaseIdx];
+                    boolean active = terminalId < window.terminals;
+                    // Wait for phase start
+                    while (System.nanoTime() < window.startNs) {
+                        Thread.sleep(1);
                     }
+                    if (active) {
+                        runPhase(proxy, terminalId, phaseIdx, window);
+                    } else {
+                        // Inactive terminals stay idle for this phase
+                        while (System.nanoTime() < window.endNs) {
+                            long remainingNs = window.endNs - System.nanoTime();
+                            if (remainingNs <= 0) {
+                                break;
+                            }
+                            long sleepMs = Math.min(TimeUnit.NANOSECONDS.toMillis(remainingNs), 100);
+                            Thread.sleep(Math.max(sleepMs, 1));
+                        }
+                    }
+                    phaseBarrier.arriveAndAwaitAdvance();
                 }
-                phaseBarrier.arriveAndAwaitAdvance();
             }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
@@ -223,7 +225,7 @@ public class SmallBankClient {
         }
     }
 
-    private void runPhase(int terminalId, int phaseNum, PhaseWindow window) {
+    private void runPhase(ServiceProxy proxy, int terminalId, int phaseNum, PhaseWindow window) {
         long seed = computeTerminalSeed(terminalId, phaseNum);
         Random terminalRandom = new Random(seed);
         RandomDistribution.Flat accountRng = new RandomDistribution.Flat(new Random(seed ^ 0x9E3779B97F4A7C15L),
@@ -252,7 +254,7 @@ public class SmallBankClient {
             SmallBankMessage.TransactionType txType = selectTransactionType(terminalRandom,
                     config.phases[phaseNum].weights);
             long txStart = System.nanoTime();
-            boolean success = executeTransaction(txType, terminalRandom, accountRng);
+            boolean success = executeTransaction(proxy, txType, terminalRandom, accountRng);
             long txEnd = System.nanoTime();
 
             if (success) {
@@ -297,7 +299,7 @@ public class SmallBankClient {
         return SmallBankMessage.TransactionType.WRITE_CHECK; // Default
     }
 
-    private boolean executeTransaction(SmallBankMessage.TransactionType type, Random rnd,
+    private boolean executeTransaction(ServiceProxy proxy, SmallBankMessage.TransactionType type, Random rnd,
             RandomDistribution.Flat accountRng) {
         try {
             SmallBankMessage msg = null;
@@ -331,18 +333,30 @@ public class SmallBankClient {
                     byte[] reply = proxy.invokeUnordered(msg.getBytes());
                     SmallBankMessage response = SmallBankMessage.getObject(reply);
                     logger.debug("Savings balance: {}", response.getSavingsBalance());
-                    return response.getResult() == 0;
+                    return isNonErrorResult(response);
             }
 
             byte[] reply = proxy.invokeOrdered(msg.getBytes());
             SmallBankMessage response = SmallBankMessage.getObject(reply);
 
-            return response.getResult() == 0;
+            return isNonErrorResult(response);
 
         } catch (Exception e) {
             logger.error("Error executing transaction {}", type, e);
             return false;
         }
+    }
+
+    private boolean isNonErrorResult(SmallBankMessage response) {
+        if (response == null) {
+            return false;
+        }
+        SmallBankMessage.StatusCode status = response.getStatusCode();
+        if (status == null) {
+            return response.getResult() == 0;
+        }
+        return status == SmallBankMessage.StatusCode.SUCCESS
+                || status == SmallBankMessage.StatusCode.INSUFFICIENT_FUNDS;
     }
 
     private void printResults(String label, double durationSeconds, MetricsSnapshot delta) {
@@ -482,8 +496,19 @@ public class SmallBankClient {
         return ((long) config.randomSeed * 31 + terminalId * 17L) ^ (phaseNum * 1_003L);
     }
 
+    private int createProxyId(int terminalId) {
+        return clientBaseId + terminalId;
+    }
+
+    private ServiceProxy createProxy(int proxyId) {
+        if (configHome == null || configHome.isBlank()) {
+            return new ServiceProxy(proxyId);
+        }
+        return new ServiceProxy(proxyId, configHome);
+    }
+
     private void close() {
-        proxy.close();
+        // Proxies are managed per-thread and closed in their respective scopes.
     }
 
     private static WorkloadConfig loadConfiguration(String configFile) throws ConfigurationException {

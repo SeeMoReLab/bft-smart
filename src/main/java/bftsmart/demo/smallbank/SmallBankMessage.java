@@ -28,6 +28,13 @@ public class SmallBankMessage implements Serializable {
         ERROR
     }
 
+    public enum StatusCode {
+        SUCCESS,
+        INSUFFICIENT_FUNDS,
+        BUSINESS_ERROR,
+        SYSTEM_ERROR
+    }
+
     private TransactionType txType;
     private long customerId;
     private String customerName;
@@ -37,10 +44,12 @@ public class SmallBankMessage implements Serializable {
     private double checkingBalance;
     private int result;
     private String errorMsg;
+    private StatusCode statusCode;
 
     private SmallBankMessage() {
         super();
         result = -1;
+        statusCode = StatusCode.SYSTEM_ERROR;
     }
 
     // CreateAccount: Creates a new customer account
@@ -113,6 +122,7 @@ public class SmallBankMessage implements Serializable {
         SmallBankMessage message = new SmallBankMessage();
         message.txType = TransactionType.RESPONSE;
         message.result = result;
+        message.statusCode = StatusCode.SUCCESS;
         return message;
     }
 
@@ -123,14 +133,20 @@ public class SmallBankMessage implements Serializable {
         message.result = result;
         message.savingsBalance = savingsBalance;
         message.checkingBalance = checkingBalance;
+        message.statusCode = StatusCode.SUCCESS;
         return message;
     }
 
     // Error message
     public static SmallBankMessage newErrorMessage(String errorMsg) {
+        return newErrorMessage(errorMsg, StatusCode.BUSINESS_ERROR);
+    }
+
+    public static SmallBankMessage newErrorMessage(String errorMsg, StatusCode statusCode) {
         SmallBankMessage message = new SmallBankMessage();
         message.txType = TransactionType.ERROR;
         message.errorMsg = errorMsg;
+        message.statusCode = statusCode;
         return message;
     }
 
@@ -186,6 +202,7 @@ public class SmallBankMessage implements Serializable {
             sb.append(", checkingBalance=").append(checkingBalance);
         }
         sb.append(", result=").append(result);
+        sb.append(", statusCode=").append(statusCode);
         sb.append(")");
         return sb.toString();
     }
@@ -225,5 +242,9 @@ public class SmallBankMessage implements Serializable {
 
     public String getErrorMsg() {
         return errorMsg;
+    }
+
+    public StatusCode getStatusCode() {
+        return statusCode;
     }
 }
