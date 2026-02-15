@@ -24,7 +24,6 @@ import bftsmart.consensus.Consensus;
 import bftsmart.consensus.Decision;
 import bftsmart.consensus.Epoch;
 import bftsmart.consensus.roles.Acceptor;
-import bftsmart.injection.*;
 import bftsmart.reconfiguration.ServerViewController;
 import bftsmart.statemanagement.StateManager;
 import bftsmart.tom.ServiceReplica;
@@ -34,17 +33,17 @@ import bftsmart.tom.core.messages.TOMMessageType;
 import bftsmart.tom.leaderchange.RequestsTimer;
 import bftsmart.tom.server.Recoverable;
 import bftsmart.tom.server.RequestVerifier;
+import bftsmart.tom.server.defaultservices.DefaultRecoverable;
+import bftsmart.tom.server.defaultservices.DefaultSingleRecoverable;
 import bftsmart.tom.util.BatchBuilder;
 import bftsmart.tom.util.BatchReader;
 import bftsmart.tom.util.TOMUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.io.Serializable;
 import java.security.*;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.CountDownLatch;
@@ -114,8 +113,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
 
     private final Synchronizer syncher;
 
-    private final int myId;
-
     private ShardHandler shardHandler = null;
 
     public TOMLayer(ExecutionManager manager,
@@ -183,7 +180,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
         this.acceptor = a;
         this.communication = cs;
         this.controller = controller;
-        this.myId = receiver.getId();
 
         /*Tulio Ribeiro*/
         this.privateKey = this.controller.getStaticConf().getPrivateKey();
@@ -393,25 +389,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
 			break;
         }
 
-        // Adaptive Timers
-        // Check if injection message
-        if (msg.isInjection()) {
-            try {
-                InjectionConfig injectionConfig = InjectionConfig.fromBytes(msg.getContent());
-                Injection injection = extractNodeSpecificInjection(injectionConfig);
-                setInjection(injection);
-                logger.info("Set Injection: {}", injection);
-
-            } catch (ClassNotFoundException | IOException ex) {
-                logger.info("Failed to read injection message {}", ex.getMessage());
-            }
-            return;
-        }
-
-        // Check if alive before processing client message
-        if (!isNodeAlive()) {
-            return;
-        }
 
         // check if this request is valid and add it to the client' pending requests list
         boolean readOnly = (msg.getReqType() == TOMMessageType.UNORDERED_REQUEST
@@ -460,47 +437,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
                 }
             }
         }
-    }
-
-    private void setInjection(Injection injection) {
-        communication.getServersConn().setInjection(injection);
-    }
-
-    /**
-     * Takes in the InjectionConfig received from the injector client
-     * and extracts the injection data relevant to this node
-     * @param injectionConfig the injection config received from injector client
-     * @return the injection object relevant to this specific node
-     */
-    private Injection extractNodeSpecificInjection(InjectionConfig injectionConfig) {
-        Injection injection = new Injection();
-
-        // Set Node Status
-        boolean amIAlive = injectionConfig.getAlive().contains(myId);
-        injection.setNodeStatus(amIAlive);
-
-        // Set ignored nodes
-        List< IgnoreNodesConfig> ignoreNodesConfigList = injectionConfig.getIgnoreNodes();
-        for (IgnoreNodesConfig ignoreNodesConfig : ignoreNodesConfigList) {
-            if (ignoreNodesConfig.getSrcNode() == myId) {
-                for (Integer ignoredNode : ignoreNodesConfig.getIgnoredNodes()) {
-                    injection.addIgnoredNode(ignoredNode);
-                }
-                break;
-            }
-        }
-
-        List<DelayConfig> delayConfigs = injectionConfig.getDelayConfigs();
-        for (DelayConfig delayConfig : delayConfigs) {
-            if (myId == delayConfig.getSrcNode()) {
-                String msgType = delayConfig.getMessageType();
-                List <TargetDelayConfig> targetDelayConfigs = delayConfig.getTargetDelays();
-                for (TargetDelayConfig targetDelayConfig : targetDelayConfigs) {
-                    injection.addDelay(msgType, targetDelayConfig.getTargetNode(), targetDelayConfig.getDelayBounds());
-                }
-            }
-        }
-        return injection;
     }
 
     /**
@@ -554,7 +490,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
             leaderLock.unlock();
 
             if (!doWork) break;
-            if (!isNodeAlive()) break;
 
             // blocks until the current consensus finishes
             proposeLock.lock();
@@ -566,7 +501,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
             proposeLock.unlock();
 
             if (!doWork) break;
-            if (!isNodeAlive()) break;
 
             logger.debug("I'm the leader.");
 
@@ -583,7 +517,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
             messagesLock.unlock();
 
             if (!doWork) break;
-            if (!isNodeAlive()) break;
 
             logger.debug("There are requests to be ordered. I will propose.");
 
@@ -623,10 +556,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
             }
         }
         logger.info("TOMLayer stopped.");
-    }
-
-    private boolean isNodeAlive() {
-        return communication.getServersConn().isAlive();
     }
 
     /**

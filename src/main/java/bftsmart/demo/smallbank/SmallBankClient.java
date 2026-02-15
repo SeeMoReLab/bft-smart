@@ -1,6 +1,5 @@
 package bftsmart.demo.smallbank;
 
-import bftsmart.injection.InjectionClient;
 import bftsmart.tom.ServiceProxy;
 import bftsmart.demo.util.Histogram;
 import bftsmart.demo.util.RandomDistribution;
@@ -81,17 +80,6 @@ public class SmallBankClient {
             if (argsLine.hasOption("create")) {
                 System.out.println("Creating accounts...");
                 client.createAccounts();
-            }
-
-            if (argsLine.hasOption("inject")) {
-                try {
-                    ExecutorService injectionExecutor = Executors.newFixedThreadPool(1);
-                    InjectionClient injectionClient = new InjectionClient(
-                            "config/injection.json", config.terminals);
-                    injectionExecutor.submit(injectionClient::start);
-                } catch (Exception ex) {
-                    System.out.println("Could not load injection config " + ex.getMessage());
-                }
             }
 
             if (argsLine.hasOption("execute")) {
@@ -596,7 +584,6 @@ public class SmallBankClient {
         options.addOption("id", "clientId", true, "Client ID for BFT-SMaRt proxy");
         options.addOption(null, "create", false, "Create initial accounts");
         options.addOption(null, "execute", false, "Execute benchmark workload");
-        options.addOption(null, "inject", false, "Enable injection");
         options.addOption("h", "help", false, "Print this help");
         return options;
     }

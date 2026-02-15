@@ -1,6 +1,5 @@
 package bftsmart.demo.smallbank2pc;
 
-import bftsmart.injection.InjectionClient;
 import bftsmart.tom.ServiceProxy;
 import org.apache.commons.cli.*;
 import org.apache.commons.configuration2.HierarchicalConfiguration;
@@ -107,17 +106,6 @@ public class SmallBankClient2PC {
             if (argsLine.hasOption("create")) {
                 System.out.println("Creating accounts across " + numShards + " shards...");
                 client.createAccounts();
-            }
-
-            if (argsLine.hasOption("inject")) {
-                try {
-                    ExecutorService injectionExecutor = Executors.newFixedThreadPool(1);
-                    InjectionClient injectionClient = new InjectionClient(
-                            "config/injection.json", config.terminals);
-                    injectionExecutor.submit(injectionClient::start);
-                } catch (Exception ex) {
-                    System.out.println("Could not load injection config " + ex.getMessage());
-                }
             }
 
             if (argsLine.hasOption("execute")) {
@@ -575,7 +563,6 @@ public class SmallBankClient2PC {
         options.addOption(null, "shard-config", true, "Base path for shard configs");
         options.addOption(null, "create", false, "Create initial accounts");
         options.addOption(null, "execute", false, "Execute benchmark workload");
-        options.addOption(null, "inject", false, "Enable injection");
         options.addOption("h", "help", false, "Print this help");
         return options;
     }
