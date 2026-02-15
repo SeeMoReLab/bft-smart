@@ -10,6 +10,8 @@ import bftsmart.tom.MessageContext;
 import bftsmart.tom.ReplicaContext;
 import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultRecoverable;
+import bftsmart.tom.util.FailureInjectionCliArgs;
+import bftsmart.tom.util.FailureInjectionController;
 import bftsmart.tom.util.Storage;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -95,45 +97,81 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     }
 
     public static void main(String[] args) throws Exception {
-        if (args.length == 2) {
-            new SmallBankServer2PC(Integer.parseInt(args[0]), Integer.parseInt(args[1]));
-        } else if (args.length == 3) {
-            if (isInteger(args[2])) {
-                // Usage with total shards specified
-                new SmallBankServer2PC(
-                        Integer.parseInt(args[0]),  // shardId
-                        Integer.parseInt(args[1]),  // replicaId
-                        Integer.parseInt(args[2]),  // totalShards
-                        null                         // configHome (use default)
-                );
-            } else {
-                // Usage with config home (default totalShards=1)
-                new SmallBankServer2PC(
-                        Integer.parseInt(args[0]),  // shardId
-                        Integer.parseInt(args[1]),  // replicaId
-                        1,                           // totalShards
-                        args[2]                      // configHome
-                );
-            }
-        } else if (args.length == 4) {
-            // Usage with total shards and config home
+        ParsedArgs parsedArgs = parseArgs(args);
+        configureFailureInjection(parsedArgs.failureArgs);
+        List<String> positionalArgs = parsedArgs.failureArgs.getPositionalArgs();
+
+        if (positionalArgs.size() == 2) {
             new SmallBankServer2PC(
-                    Integer.parseInt(args[0]),  // shardId
-                    Integer.parseInt(args[1]),  // replicaId
-                    Integer.parseInt(args[2]),  // totalShards
-                    args[3]                      // configHome
+                    Integer.parseInt(positionalArgs.get(0)),
+                    Integer.parseInt(positionalArgs.get(1)),
+                    1,
+                    parsedArgs.configDir);
+        } else if (positionalArgs.size() == 3) {
+            new SmallBankServer2PC(
+                    Integer.parseInt(positionalArgs.get(0)),  // shardId
+                    Integer.parseInt(positionalArgs.get(1)),  // replicaId
+                    Integer.parseInt(positionalArgs.get(2)),  // totalShards
+                    parsedArgs.configDir
             );
         } else {
-            System.out.println("Usage: java ... SmallBankServer2PC <shard_id> <replica_id> [<total_shards>|<config_home>] [<config_home>]");
+            System.out.println("Usage: java ... SmallBankServer2PC <shard_id> <replica_id> "
+                    + "[<total_shards>] [--config-dir <path>] "
+                    + "[--failure-spec <path>] [--failure-start-unix-ms <ms>]");
         }
     }
 
-    private static boolean isInteger(String value) {
-        try {
-            Integer.parseInt(value);
-            return true;
-        } catch (NumberFormatException ignored) {
-            return false;
+    private static void configureFailureInjection(FailureInjectionCliArgs.Parsed cliArgs) {
+        if (!cliArgs.hasFailureInjection()) {
+            FailureInjectionController.disable();
+            return;
+        }
+        FailureInjectionController.configure(cliArgs.getFailureSpecPath(), cliArgs.getFailureStartUnixMs());
+    }
+
+    private static ParsedArgs parseArgs(String[] args) {
+        List<String> remaining = new ArrayList<>();
+        String configDir = null;
+
+        for (int i = 0; i < args.length; i++) {
+            String arg = args[i];
+            if ("--config-dir".equals(arg)) {
+                if (configDir != null) {
+                    throw new IllegalArgumentException("Duplicate flag: --config-dir");
+                }
+                if (i + 1 >= args.length) {
+                    throw new IllegalArgumentException("Missing value for --config-dir");
+                }
+                configDir = args[++i].trim();
+                if (configDir.isEmpty()) {
+                    throw new IllegalArgumentException("Missing value for --config-dir");
+                }
+                continue;
+            }
+            if (arg.startsWith("--config-dir=")) {
+                if (configDir != null) {
+                    throw new IllegalArgumentException("Duplicate flag: --config-dir");
+                }
+                configDir = arg.substring("--config-dir=".length()).trim();
+                if (configDir.isEmpty()) {
+                    throw new IllegalArgumentException("Missing value for --config-dir");
+                }
+                continue;
+            }
+            remaining.add(arg);
+        }
+
+        FailureInjectionCliArgs.Parsed failureArgs = FailureInjectionCliArgs.parse(remaining.toArray(new String[0]));
+        return new ParsedArgs(configDir, failureArgs);
+    }
+
+    private static final class ParsedArgs {
+        private final String configDir;
+        private final FailureInjectionCliArgs.Parsed failureArgs;
+
+        private ParsedArgs(String configDir, FailureInjectionCliArgs.Parsed failureArgs) {
+            this.configDir = configDir;
+            this.failureArgs = failureArgs;
         }
     }
 

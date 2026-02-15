@@ -13,7 +13,6 @@ import org.apache.commons.configuration2.tree.xpath.XPathExpressionEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
@@ -34,7 +33,6 @@ public class SmallBankClient2PC {
     private static final String SINGLE_LINE = "======================================================================";
     private static final String DEFAULT_CONFIG_HOME = "config";
     private static final String WORKLOAD_FILE_NAME = "smallbank.xml";
-    private static final String LEGACY_WORKLOAD_FILE_NAME = "smallbank_config.xml";
 
     // Client configuration
     private final int clientId;
@@ -67,16 +65,17 @@ public class SmallBankClient2PC {
             }
 
             List<String> positionalArgs = argsLine.getArgList();
-            if (positionalArgs.size() > 1) {
+            if (!positionalArgs.isEmpty()) {
                 printUsage(options);
                 return;
             }
 
-            String configHome = positionalArgs.isEmpty() ? null : positionalArgs.get(0);
+            String configHome = argsLine.getOptionValue("config-dir", DEFAULT_CONFIG_HOME);
             String configFile = resolveWorkloadConfigFile(configHome);
             int clientId = Integer.parseInt(argsLine.getOptionValue("id", "0"));
             int numShards = Integer.parseInt(argsLine.getOptionValue("shards", "1"));
             String shardConfigBase = argsLine.getOptionValue("shard-config", "");
+            Long startUnixMs = parseStartUnixMs(argsLine.getOptionValue("start-unix-ms"));
 
             System.out.println(SINGLE_LINE);
             System.out.println("SmallBank BFT-SMaRt Client (2PC Enabled)");
@@ -86,6 +85,9 @@ public class SmallBankClient2PC {
             System.out.println("Number of shards: " + numShards);
             if (!shardConfigBase.isEmpty()) {
                 System.out.println("Shard config base: " + shardConfigBase);
+            }
+            if (startUnixMs != null) {
+                System.out.println("Benchmark start unix ms: " + startUnixMs);
             }
             System.out.println(SINGLE_LINE);
 
@@ -110,6 +112,7 @@ public class SmallBankClient2PC {
 
             if (argsLine.hasOption("execute")) {
                 System.out.println("Executing workload...");
+                waitUntilStartUnixMs(startUnixMs);
                 for (int i = 0; i < config.phases.length; i++) {
                     client.executeWorkload(i);
                 }
@@ -541,24 +544,14 @@ public class SmallBankClient2PC {
     private static String resolveWorkloadConfigFile(String configHome) {
         Path configDir = Paths.get(defaultConfigHome(configHome));
         Path workloadFile = configDir.resolve(WORKLOAD_FILE_NAME);
-        if (Files.isRegularFile(workloadFile)) {
-            return workloadFile.toString();
-        }
-
-        Path legacyFile = configDir.resolve(LEGACY_WORKLOAD_FILE_NAME);
-        if (Files.isRegularFile(legacyFile)) {
-            System.out.printf(
-                    "Warning: workload file '%s' not found, falling back to '%s'%n",
-                    workloadFile, legacyFile);
-            return legacyFile.toString();
-        }
-
         return workloadFile.toString();
     }
 
     private static Options buildOptions() {
         Options options = new Options();
         options.addOption("id", "clientId", true, "Client ID for BFT-SMaRt proxy");
+        options.addOption(null, "config-dir", true, "Configuration directory (default: config)");
+        options.addOption(null, "start-unix-ms", true, "Absolute Unix epoch time in ms for benchmark start");
         options.addOption("s", "shards", true, "Number of shards (default: 1)");
         options.addOption(null, "shard-config", true, "Base path for shard configs");
         options.addOption(null, "create", false, "Create initial accounts");
@@ -569,12 +562,48 @@ public class SmallBankClient2PC {
 
     private static void printUsage(Options options) {
         HelpFormatter formatter = new HelpFormatter();
-        formatter.printHelp("SmallBankClient2PC [config_home]", options);
+        formatter.printHelp("SmallBankClient2PC", options);
         System.out.println("\nExamples:");
         System.out.println("  Single shard:");
-        System.out.println("    java ... SmallBankClient2PC --create --execute");
+        System.out.println("    java ... SmallBankClient2PC --config-dir config --create --execute");
         System.out.println("\n  Multi-shard (2 shards):");
-        System.out.println("    java ... SmallBankClient2PC config -s 2 --create --execute");
+        System.out.println("    java ... SmallBankClient2PC --config-dir config -s 2 --create --execute");
+        System.out.println("    java ... SmallBankClient2PC --config-dir config -s 2 --execute --start-unix-ms 1735689600000");
+    }
+
+    private static Long parseStartUnixMs(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return null;
+        }
+        long parsed;
+        try {
+            parsed = Long.parseLong(value.trim());
+        } catch (NumberFormatException numberFormatException) {
+            throw new IllegalArgumentException("Invalid --start-unix-ms value: " + value);
+        }
+        if (parsed < 0) {
+            throw new IllegalArgumentException("--start-unix-ms must be >= 0");
+        }
+        return parsed;
+    }
+
+    private static void waitUntilStartUnixMs(Long startUnixMs) {
+        if (startUnixMs == null) {
+            return;
+        }
+        while (true) {
+            long remainingMs = startUnixMs - System.currentTimeMillis();
+            if (remainingMs <= 0) {
+                return;
+            }
+            long sleepMs = Math.min(remainingMs, 200L);
+            try {
+                Thread.sleep(sleepMs);
+            } catch (InterruptedException interruptedException) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
     }
 
     private static class WorkloadConfig {

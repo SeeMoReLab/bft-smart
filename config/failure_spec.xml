@@ -19,7 +19,7 @@
     <phases>
         <phase>
             <!-- Activate this phase at t=0 seconds from experiment start -->
-            <atTime>0</atTime>
+            <atTime>10</atTime>
 
             <network>
                 <directedEdges>true</directedEdges>
@@ -62,12 +62,12 @@
                 -->
                 <proposalDelay>
                     <replicas>
-                        <!--
+
                         <replica>
-                            <id>1</id>
-                            <delayMs>150</delayMs>
+                            <id>0</id>
+                            <delayMs>200</delayMs>
                         </replica>
-                        -->
+
                     </replicas>
                 </proposalDelay>
             </pbft>

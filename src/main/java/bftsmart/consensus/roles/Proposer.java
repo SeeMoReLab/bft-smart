@@ -18,6 +18,7 @@ package bftsmart.consensus.roles;
 import bftsmart.communication.ServerCommunicationSystem;
 import bftsmart.consensus.messages.MessageFactory;
 import bftsmart.reconfiguration.ServerViewController;
+import bftsmart.tom.util.FailureInjectionController;
 
 /**
  * This class represents the proposer role in the consensus protocol.
@@ -51,6 +52,15 @@ public class Proposer {
      * @param value Value to be proposed
      */
     public void startConsensus(int cid, byte[] value) {
+        int proposalDelayMs = FailureInjectionController
+                .getProposalDelayMs(this.controller.getStaticConf().getProcessId());
+        if (proposalDelayMs > 0) {
+            try {
+                Thread.sleep(proposalDelayMs);
+            } catch (InterruptedException interruptedException) {
+                Thread.currentThread().interrupt();
+            }
+        }
         //******* EDUARDO BEGIN **************//
         communication.send(this.controller.getCurrentViewAcceptors(),
                 factory.createPropose(cid, 0, value));
