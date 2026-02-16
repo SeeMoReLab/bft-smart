@@ -1,5 +1,26 @@
 package bftsmart.demo.smallbank2pc;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.ObjectInput;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutput;
+import java.io.ObjectOutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import bftsmart.rlrpc.LearningAgentGrpc;
 import bftsmart.rlrpc.Report;
 import bftsmart.rlrpc.ReportLocal;
@@ -15,13 +36,6 @@ import bftsmart.tom.util.FailureInjectionController;
 import bftsmart.tom.util.Storage;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.*;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 
 public class SmallBankServer2PC extends DefaultRecoverable {
     private static final Logger logger = LoggerFactory.getLogger(SmallBankServer2PC.class);
@@ -45,7 +59,9 @@ public class SmallBankServer2PC extends DefaultRecoverable {
 
     /* Adaptive timers */
     private Storage consensusLatency;
+    // Legacy snapshot field kept for backward compatibility.
     private long iterations = 0;
+    private int lastProcessedConsensusId = -1;
     private ServiceReplica replica;
     private ManagedChannel learnerChannel;
     private LearningAgentGrpc.LearningAgentBlockingStub learnerStub;
@@ -59,6 +75,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     private Report pendingRewardReport;
     private int pendingRewardEpisode;
     private int pendingRewardTimeoutMs;
+    private final boolean learning;
 
     // Shard configuration (for logging/debugging)
     private ReplicaContext replicaContext;
@@ -106,17 +123,20 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                     Integer.parseInt(positionalArgs.get(0)),
                     Integer.parseInt(positionalArgs.get(1)),
                     1,
-                    parsedArgs.configDir);
+                    parsedArgs.configDir,
+                    parsedArgs.learning);
         } else if (positionalArgs.size() == 3) {
             new SmallBankServer2PC(
                     Integer.parseInt(positionalArgs.get(0)),  // shardId
                     Integer.parseInt(positionalArgs.get(1)),  // replicaId
                     Integer.parseInt(positionalArgs.get(2)),  // totalShards
-                    parsedArgs.configDir
+                    parsedArgs.configDir,
+                    parsedArgs.learning
             );
         } else {
             System.out.println("Usage: java ... SmallBankServer2PC <shard_id> <replica_id> "
                     + "[<total_shards>] [--config-dir <path>] "
+                    + "[--learning] "
                     + "[--failure-spec <path>] [--failure-start-unix-ms <ms>]");
         }
     }
@@ -132,6 +152,8 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     private static ParsedArgs parseArgs(String[] args) {
         List<String> remaining = new ArrayList<>();
         String configDir = null;
+        boolean learning = false;
+        boolean consultFlagConfigured = false;
 
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -158,25 +180,37 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                 }
                 continue;
             }
+            if ("--learning".equals(arg)) {
+                if (consultFlagConfigured) {
+                    throw new IllegalArgumentException("Duplicate flag: --learning");
+                }
+                learning = true;
+                consultFlagConfigured = true;
+                continue;
+            }
             remaining.add(arg);
         }
 
         FailureInjectionCliArgs.Parsed failureArgs = FailureInjectionCliArgs.parse(remaining.toArray(new String[0]));
-        return new ParsedArgs(configDir, failureArgs);
+        return new ParsedArgs(configDir, learning, failureArgs);
     }
 
     private static final class ParsedArgs {
         private final String configDir;
+        private final boolean learning;
         private final FailureInjectionCliArgs.Parsed failureArgs;
 
-        private ParsedArgs(String configDir, FailureInjectionCliArgs.Parsed failureArgs) {
+        private ParsedArgs(String configDir,
+                           boolean learning,
+                           FailureInjectionCliArgs.Parsed failureArgs) {
             this.configDir = configDir;
+            this.learning = learning;
             this.failureArgs = failureArgs;
         }
     }
 
     private SmallBankServer2PC(int shardId, int id) {
-        this(shardId, id, 1, null);
+        this(shardId, id, 1, null, false);
     }
 
     /**
@@ -188,9 +222,18 @@ public class SmallBankServer2PC extends DefaultRecoverable {
      * @param configHome  Configuration directory (null for default)
      */
     public SmallBankServer2PC(int shardId, int replicaId, int totalShards, String configHome) {
+        this(shardId, replicaId, totalShards, configHome, false);
+    }
+
+    public SmallBankServer2PC(int shardId,
+                              int replicaId,
+                              int totalShards,
+                              String configHome,
+                              boolean learning) {
         this.myShardId = shardId;
         this.myReplicaId = replicaId;
         this.totalShards = totalShards;
+        this.learning = learning;
         this.accounts = new HashMap<>();
         this.checking = new HashMap<>();
         this.savings = new HashMap<>();
@@ -209,7 +252,11 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         this.replicaContext = ctx;
         this.myReplicaId = ctx.getSVController().getStaticConf().getProcessId();
         logger.info("ReplicaContext set: shardId={}, replicaId={}", myShardId, myReplicaId);
-        initLearningAgentClient();
+        if (learning) {
+            initLearningAgentClient();
+        } else {
+            logger.info("Learning-agent timeout recommendation is disabled.");
+        }
         if (currentTimeoutMs < 0) {
             currentTimeoutMs = ctx.getSVController().getStaticConf().getRequestTimeout();
             lastTimeoutUsedMs = currentTimeoutMs;
@@ -221,32 +268,37 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         byte[][] replies = new byte[commands.length][];
         int index = 0;
         for (byte[] command : commands) {
-            if (msgCtx != null && msgCtx[index] != null && msgCtx[index].getConsensusId() % 1000 == 0 && !logPrinted) {
-                System.out.println("SmallBankServer2PC executing CID: " + msgCtx[index].getConsensusId());
+            MessageContext currentMsgCtx = (msgCtx != null) ? msgCtx[index] : null;
+            if (currentMsgCtx != null && currentMsgCtx.getConsensusId() % 1000 == 0 && !logPrinted) {
+                System.out.println("SmallBankServer2PC executing CID: " + currentMsgCtx.getConsensusId());
                 logPrinted = true;
             } else {
                 logPrinted = false;
             }
 
-            boolean isNoOp = msgCtx != null && msgCtx[index] != null && msgCtx[index].isNoOp();
-            if (!isNoOp) {
-                long iterationIndex = iterations;
-                iterations++;
-                int offsetInEpisode = (int) (iterationIndex % EPISODE_LENGTH);
-                int episode = (int) (iterationIndex / EPISODE_LENGTH) + 1;
+            if (currentMsgCtx != null) {
+                int consensusId = currentMsgCtx.getConsensusId();
+                if (consensusId > lastProcessedConsensusId) {
+                    lastProcessedConsensusId = consensusId;
+                    int offsetInEpisode = Math.floorMod(consensusId, EPISODE_LENGTH);
+                    int episode = Math.floorDiv(consensusId, EPISODE_LENGTH) + 1;
 
-                if (msgCtx != null && msgCtx[index].getFirstInBatch() != null) {
-                    consensusLatency.store(msgCtx[index].getFirstInBatch().decisionTime - msgCtx[index].getFirstInBatch().consensusStartTime);
-                }
-                if (offsetInEpisode == REPORT_TRIGGER_OFFSET) {
-                    sendStateReport(episode);
-                    startTimeoutPolling(episode);
-                } else if (offsetInEpisode == APPLY_TRIGGER_OFFSET) {
-                    applyTimeoutIfReady(episode);
-                    consensusLatency.reset();
-                } else if (offsetInEpisode == EPISODE_END_OFFSET) {
-                    captureReward(episode);
-                    consensusLatency.reset();
+                    if (currentMsgCtx.getFirstInBatch() != null) {
+                        consensusLatency.store(currentMsgCtx.getFirstInBatch().decisionTime
+                                - currentMsgCtx.getFirstInBatch().consensusStartTime);
+                    }
+                    if (offsetInEpisode == REPORT_TRIGGER_OFFSET) {
+                        if (learning) {
+                            sendStateReport(episode);
+                            startTimeoutPolling(episode);
+                        }
+                    } else if (offsetInEpisode == APPLY_TRIGGER_OFFSET) {
+                        applyTimeoutIfReady(episode);
+                        consensusLatency.reset();
+                    } else if (offsetInEpisode == EPISODE_END_OFFSET) {
+                        captureReward(episode);
+                        consensusLatency.reset();
+                    }
                 }
             }
 
@@ -723,6 +775,9 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     }
 
     private void initLearningAgentClient() {
+        if (!learning) {
+            return;
+        }
         if (learnerStub != null || replicaContext == null) {
             return;
         }
@@ -761,6 +816,9 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     }
 
     private void sendStateReport(int episode) {
+        if (!learning) {
+            return;
+        }
         if (learnerStub == null) {
             return;
         }
@@ -794,6 +852,9 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     }
 
     private void startTimeoutPolling(int episode) {
+        if (!learning) {
+            return;
+        }
         if (learnerStub == null) {
             return;
         }
@@ -812,6 +873,9 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     }
 
     private void pollForTimeout(int episode) {
+        if (!learning) {
+            return;
+        }
         TimeoutRequest request = TimeoutRequest.newBuilder()
                 .setEpisode(episode)
                 .build();
@@ -840,6 +904,10 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     }
 
     private void applyTimeoutIfReady(int episode) {
+        if (!learning) {
+            lastTimeoutUsedMs = currentTimeoutMs;
+            return;
+        }
         synchronized (pollerLock) {
             pollerStopRequested = true;
             if (timeoutPollerThread != null) {
@@ -855,6 +923,9 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     }
 
     private void captureReward(int episode) {
+        if (!learning) {
+            return;
+        }
         Report rewardReport = buildReportFromStorage();
         if (rewardReport == null) {
             return;

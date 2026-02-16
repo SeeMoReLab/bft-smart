@@ -1,5 +1,18 @@
 package bftsmart.demo.smallbank;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.ObjectInput;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutput;
+import java.io.ObjectOutputStream;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+
 import bftsmart.rlrpc.LearningAgentGrpc;
 import bftsmart.rlrpc.Report;
 import bftsmart.rlrpc.ReportLocal;
@@ -14,12 +27,6 @@ import bftsmart.tom.util.FailureInjectionController;
 import bftsmart.tom.util.Storage;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
-
-import java.io.*;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 public class SmallBankServer extends DefaultRecoverable {
     private static final boolean _debug = false;
@@ -36,8 +43,9 @@ public class SmallBankServer extends DefaultRecoverable {
 
     /* Adaptive timers */
     private Storage consensusLatency;
-    // Count of non-no-op executions (persisted in snapshot for recovery sync).
+    // Legacy snapshot field kept for backward compatibility.
     private long iterations = 0;
+    private int lastProcessedConsensusId = -1;
     private ServiceReplica replica;
     private ManagedChannel learnerChannel;
     private LearningAgentGrpc.LearningAgentBlockingStub learnerStub;
@@ -51,6 +59,7 @@ public class SmallBankServer extends DefaultRecoverable {
     private Report pendingRewardReport;
     private int pendingRewardEpisode;
     private int pendingRewardTimeoutMs;
+    private final boolean learning;
 
     public static void main(String[] args) throws Exception {
         ParsedArgs parsedArgs = parseArgs(args);
@@ -60,12 +69,14 @@ public class SmallBankServer extends DefaultRecoverable {
         if (positionalArgs.size() == 1) {
             int replicaId = Integer.parseInt(positionalArgs.get(0));
             if (parsedArgs.configDir == null || parsedArgs.configDir.trim().isEmpty()) {
-                new SmallBankServer(replicaId);
+                new SmallBankServer(replicaId, null, parsedArgs.learning);
             } else {
-                new SmallBankServer(replicaId, parsedArgs.configDir);
+                new SmallBankServer(replicaId, parsedArgs.configDir,
+                        parsedArgs.learning);
             }
         } else {
             System.out.println("Usage: java ... SmallBankServer <replica_id> [--config-dir <path>] "
+                    + "[--learning] "
                     + "[--failure-spec <path>] [--failure-start-unix-ms <ms>]");
         }
     }
@@ -81,6 +92,8 @@ public class SmallBankServer extends DefaultRecoverable {
     private static ParsedArgs parseArgs(String[] args) {
         List<String> remaining = new ArrayList<>();
         String configDir = null;
+        boolean learning = false;
+        boolean consultFlagConfigured = false;
 
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -107,28 +120,45 @@ public class SmallBankServer extends DefaultRecoverable {
                 }
                 continue;
             }
+            if ("--learning".equals(arg)) {
+                if (consultFlagConfigured) {
+                    throw new IllegalArgumentException("Duplicate flag: --learning");
+                }
+                learning = true;
+                consultFlagConfigured = true;
+                continue;
+            }
             remaining.add(arg);
         }
 
         FailureInjectionCliArgs.Parsed failureArgs = FailureInjectionCliArgs.parse(remaining.toArray(new String[0]));
-        return new ParsedArgs(configDir, failureArgs);
+        return new ParsedArgs(configDir, learning, failureArgs);
     }
 
     private static final class ParsedArgs {
         private final String configDir;
+        private final boolean learning;
         private final FailureInjectionCliArgs.Parsed failureArgs;
 
-        private ParsedArgs(String configDir, FailureInjectionCliArgs.Parsed failureArgs) {
+        private ParsedArgs(String configDir,
+                           boolean learning,
+                           FailureInjectionCliArgs.Parsed failureArgs) {
             this.configDir = configDir;
+            this.learning = learning;
             this.failureArgs = failureArgs;
         }
     }
 
     private SmallBankServer(int id) {
-        this(id, null);
+        this(id, null, false);
     }
 
     private SmallBankServer(int id, String configHome) {
+        this(id, configHome, false);
+    }
+
+    private SmallBankServer(int id, String configHome, boolean learning) {
+        this.learning = learning;
         this.accounts = new HashMap<>();
         this.checking = new HashMap<>();
         this.savings = new HashMap<>();
@@ -138,7 +168,11 @@ public class SmallBankServer extends DefaultRecoverable {
         } else {
             replica = new ServiceReplica(id, configHome, this, this, null, null, null);
         }
-        initLearningAgentClient();
+        if (this.learning) {
+            initLearningAgentClient();
+        } else {
+            System.out.println("Learning-agent timeout recommendation is disabled.");
+        }
         this.currentTimeoutMs = replica.getReplicaContext().getStaticConfiguration().getRequestTimeout();
         this.lastTimeoutUsedMs = currentTimeoutMs;
     }
@@ -148,34 +182,38 @@ public class SmallBankServer extends DefaultRecoverable {
         byte[][] replies = new byte[commands.length][];
         int index = 0;
         for (byte[] command : commands) {
-            if (msgCtx != null && msgCtx[index] != null && msgCtx[index].getConsensusId() % 1000 == 0 && !logPrinted) {
-                System.out.println("SmallBankServer executing CID: " + msgCtx[index].getConsensusId());
+            MessageContext currentMsgCtx = (msgCtx != null) ? msgCtx[index] : null;
+            if (currentMsgCtx != null && currentMsgCtx.getConsensusId() % 1000 == 0 && !logPrinted) {
+                System.out.println("SmallBankServer executing CID: " + currentMsgCtx.getConsensusId());
                 logPrinted = true;
             } else {
                 logPrinted = false;
             }
 
-            boolean isNoOp = msgCtx != null && msgCtx[index] != null && msgCtx[index].isNoOp();
-            if (!isNoOp) {
-                long iterationIndex = iterations;
-                iterations++;
-                int offsetInEpisode = (int) (iterationIndex % EPISODE_LENGTH);
-                int episode = (int) (iterationIndex / EPISODE_LENGTH) + 1;
+            if (currentMsgCtx != null) {
+                int consensusId = currentMsgCtx.getConsensusId();
+                if (consensusId > lastProcessedConsensusId) {
+                    lastProcessedConsensusId = consensusId;
+                    int offsetInEpisode = Math.floorMod(consensusId, EPISODE_LENGTH);
+                    int episode = Math.floorDiv(consensusId, EPISODE_LENGTH) + 1;
 
-                if (msgCtx != null && msgCtx[index].getFirstInBatch() != null) {
-                    consensusLatency.store(msgCtx[index].getFirstInBatch().decisionTime
-                            - msgCtx[index].getFirstInBatch().consensusStartTime);
-                }
+                    if (currentMsgCtx.getFirstInBatch() != null) {
+                        consensusLatency.store(currentMsgCtx.getFirstInBatch().decisionTime
+                                - currentMsgCtx.getFirstInBatch().consensusStartTime);
+                    }
 
-                if (offsetInEpisode == REPORT_TRIGGER_OFFSET) {
-                    sendStateReport(episode);
-                    startTimeoutPolling(episode);
-                } else if (offsetInEpisode == APPLY_TRIGGER_OFFSET) {
-                    applyTimeoutIfReady(episode);
-                    consensusLatency.reset();
-                } else if (offsetInEpisode == EPISODE_END_OFFSET) {
-                    captureReward(episode);
-                    consensusLatency.reset();
+                    if (offsetInEpisode == REPORT_TRIGGER_OFFSET) {
+                        if (learning) {
+                            sendStateReport(episode);
+                            startTimeoutPolling(episode);
+                        }
+                    } else if (offsetInEpisode == APPLY_TRIGGER_OFFSET) {
+                        applyTimeoutIfReady(episode);
+                        consensusLatency.reset();
+                    } else if (offsetInEpisode == EPISODE_END_OFFSET) {
+                        captureReward(episode);
+                        consensusLatency.reset();
+                    }
                 }
             }
 
@@ -410,6 +448,9 @@ public class SmallBankServer extends DefaultRecoverable {
     }
 
     private void initLearningAgentClient() {
+        if (!learning) {
+            return;
+        }
         int replicaId = replica.getReplicaContext().getStaticConfiguration().getProcessId();
         String host = replica.getReplicaContext().getStaticConfiguration().getHost(replicaId);
         int port = replica.getReplicaContext().getStaticConfiguration().getLearnerPort(replicaId);
@@ -445,6 +486,9 @@ public class SmallBankServer extends DefaultRecoverable {
     }
 
     private void sendStateReport(int episode) {
+        if (!learning) {
+            return;
+        }
         if (learnerStub == null) {
             return;
         }
@@ -477,6 +521,9 @@ public class SmallBankServer extends DefaultRecoverable {
     }
 
     private void startTimeoutPolling(int episode) {
+        if (!learning) {
+            return;
+        }
         if (learnerStub == null) {
             return;
         }
@@ -495,6 +542,9 @@ public class SmallBankServer extends DefaultRecoverable {
     }
 
     private void pollForTimeout(int episode) {
+        if (!learning) {
+            return;
+        }
         TimeoutRequest request = TimeoutRequest.newBuilder()
                 .setEpisode(episode)
                 .build();
@@ -523,6 +573,10 @@ public class SmallBankServer extends DefaultRecoverable {
     }
 
     private void applyTimeoutIfReady(int episode) {
+        if (!learning) {
+            lastTimeoutUsedMs = currentTimeoutMs;
+            return;
+        }
         synchronized (pollerLock) {
             pollerStopRequested = true;
             if (timeoutPollerThread != null) {
@@ -538,6 +592,9 @@ public class SmallBankServer extends DefaultRecoverable {
     }
 
     private void captureReward(int episode) {
+        if (!learning) {
+            return;
+        }
         Report rewardReport = buildReportFromStorage();
         if (rewardReport == null) {
             return;
