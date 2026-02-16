@@ -35,6 +35,7 @@ public class SmallBankClient {
     private static final int MAX_LATENCY_MS = 10_000; // bucket upper bound; overflow latencies are clamped
     private static final String DEFAULT_CONFIG_HOME = "config";
     private static final String WORKLOAD_FILE_NAME = "smallbank.xml";
+    private static final int ACCOUNT_CREATION_TERMINALS = 100;
 
     private final int clientBaseId;
     private final String configHome;
@@ -112,34 +113,67 @@ public class SmallBankClient {
     private void createAccounts() {
         logger.info("Creating {} accounts...", config.numAccounts);
         long startTime = System.currentTimeMillis();
-        try (ServiceProxy proxy = createProxy(clientBaseId)) {
-            for (long custId = 0; custId < config.numAccounts; custId++) {
-                String custName = String.format("Customer%010d", custId);
-                double savingsBalance = 10000.0;
-                double checkingBalance = 10000.0;
+        ExecutorService executor = Executors.newFixedThreadPool(ACCOUNT_CREATION_TERMINALS);
+        AtomicLong processed = new AtomicLong(0);
+        AtomicInteger creationErrors = new AtomicInteger(0);
+        List<Future<?>> futures = new ArrayList<>();
 
-                SmallBankMessage msg = SmallBankMessage.newCreateAccountRequest(
-                        custId, custName, savingsBalance, checkingBalance);
+        for (int terminalId = 0; terminalId < ACCOUNT_CREATION_TERMINALS; terminalId++) {
+            final int workerId = terminalId;
+            futures.add(executor.submit(() -> {
+                try (ServiceProxy proxy = createProxy(createProxyId(10_000 + workerId))) {
+                    for (long custId = workerId; custId < config.numAccounts; custId += ACCOUNT_CREATION_TERMINALS) {
+                        String custName = String.format("Customer%010d", custId);
+                        double savingsBalance = 10000.0;
+                        double checkingBalance = 10000.0;
 
-                try {
-                    byte[] reply = proxy.invokeOrdered(msg.getBytes());
-                    SmallBankMessage response = SmallBankMessage.getObject(reply);
+                        SmallBankMessage msg = SmallBankMessage.newCreateAccountRequest(
+                                custId, custName, savingsBalance, checkingBalance);
 
-                    if (response.getResult() != 0) {
-                        logger.error("Failed to create account {}: {}", custId, response.getErrorMsg());
+                        try {
+                            byte[] reply = proxy.invokeOrdered(msg.getBytes());
+                            SmallBankMessage response = SmallBankMessage.getObject(reply);
+                            if (response == null || response.getResult() != 0) {
+                                creationErrors.incrementAndGet();
+                                logger.error("Failed to create account {}: {}", custId,
+                                        (response == null) ? "null response" : response.getErrorMsg());
+                            }
+                        } catch (Exception e) {
+                            creationErrors.incrementAndGet();
+                            logger.error("Error creating account {}", custId, e);
+                        }
+
+                        long current = processed.incrementAndGet();
+                        if (current % 1000 == 0) {
+                            logger.info("Created {} accounts", current);
+                        }
                     }
                 } catch (Exception e) {
-                    logger.error("Error creating account {}", custId, e);
+                    creationErrors.incrementAndGet();
+                    logger.error("Account creation worker {} failed", workerId, e);
                 }
+            }));
+        }
 
-                if ((custId + 1) % 1000 == 0) {
-                    logger.info("Created {} accounts", custId + 1);
-                }
+        executor.shutdown();
+        for (Future<?> future : futures) {
+            try {
+                future.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (ExecutionException e) {
+                creationErrors.incrementAndGet();
+                logger.error("Account creation task failed", e.getCause());
             }
+        }
+        if (!executor.isTerminated()) {
+            executor.shutdownNow();
         }
 
         long duration = System.currentTimeMillis() - startTime;
-        logger.info("Finished creating {} accounts in {} ms", config.numAccounts, duration);
+        logger.info("Finished creating {} accounts in {} ms (errors={})",
+                processed.get(), duration, creationErrors.get());
     }
 
     private void executeWorkload() {

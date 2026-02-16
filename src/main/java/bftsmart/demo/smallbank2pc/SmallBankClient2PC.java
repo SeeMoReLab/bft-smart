@@ -33,6 +33,7 @@ public class SmallBankClient2PC {
     private static final String SINGLE_LINE = "======================================================================";
     private static final String DEFAULT_CONFIG_HOME = "config";
     private static final String WORKLOAD_FILE_NAME = "smallbank.xml";
+    private static final int ACCOUNT_CREATION_TERMINALS = 100;
 
     // Client configuration
     private final int clientId;
@@ -188,41 +189,67 @@ public class SmallBankClient2PC {
     private void createAccounts() {
         System.out.printf("Creating %d accounts across %d shards...%n", config.numAccounts, numShards);
         long startTime = System.currentTimeMillis();
+        ExecutorService executor = Executors.newFixedThreadPool(ACCOUNT_CREATION_TERMINALS);
+        AtomicLong processed = new AtomicLong(0);
+        AtomicInteger creationErrors = new AtomicInteger(0);
+        List<Future<?>> futures = new ArrayList<>();
 
-        for (long custId = 0; custId < config.numAccounts; custId++) {
-            String custName = String.format("Customer%010d", custId);
-            double savingsBalance = 10000.0;
-            double checkingBalance = 10000.0;
+        for (int terminalId = 0; terminalId < ACCOUNT_CREATION_TERMINALS; terminalId++) {
+            final int workerId = terminalId;
+            futures.add(executor.submit(() -> {
+                for (long custId = workerId; custId < config.numAccounts; custId += ACCOUNT_CREATION_TERMINALS) {
+                    String custName = String.format("Customer%010d", custId);
+                    double savingsBalance = 10000.0;
+                    double checkingBalance = 10000.0;
 
-            SmallBankMessage2PC msg = SmallBankMessage2PC.newCreateAccountRequest(
-                    custId, custName, savingsBalance, checkingBalance
-            );
+                    SmallBankMessage2PC msg = SmallBankMessage2PC.newCreateAccountRequest(
+                            custId, custName, savingsBalance, checkingBalance
+                    );
 
-            // Route to correct shard
-            int targetShard = getShardForAccount(custId);
-            // System.out.println("Creating account " + custId + " on shard " + targetShard);
-            ServiceProxy proxy = shardProxies.get(targetShard);
+                    int targetShard = getShardForAccount(custId);
+                    ServiceProxy proxy = shardProxies.get(targetShard);
 
-            try {
-                byte[] reply = proxy.invokeOrdered(msg.getBytes());
-                SmallBankMessage2PC response = SmallBankMessage2PC.getObject(reply);
+                    try {
+                        byte[] reply = proxy.invokeOrdered(msg.getBytes());
+                        SmallBankMessage2PC response = SmallBankMessage2PC.getObject(reply);
+                        if (response == null || response.getResult() != 0) {
+                            creationErrors.incrementAndGet();
+                            String error = response != null ? response.getErrorMsg() : "null response";
+                            System.out.println("Failed to create account " + custId + " on shard " +
+                                    targetShard + ": " + error);
+                        }
+                    } catch (Exception e) {
+                        creationErrors.incrementAndGet();
+                        System.out.println("Error creating account " + custId + ": " + e);
+                    }
 
-                if (response == null || response.getResult() != 0) {
-                    String error = response != null ? response.getErrorMsg() : "null response";
-                    System.out.println("Failed to create account " + custId + " on shard " +
-                                      targetShard + ": " + error);
+                    long current = processed.incrementAndGet();
+                    if (current % 1000 == 0) {
+                        System.out.printf("Created %d accounts%n", current);
+                    }
                 }
-            } catch (Exception e) {
-                System.out.println("Error creating account " + custId + ": " + e);
-            }
+            }));
+        }
 
-            if ((custId + 1) % 1000 == 0) {
-                System.out.printf("Created %d accounts%n", custId + 1);
+        executor.shutdown();
+        for (Future<?> future : futures) {
+            try {
+                future.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (ExecutionException e) {
+                creationErrors.incrementAndGet();
+                System.out.println("Account creation task failed: " + e.getCause());
             }
+        }
+        if (!executor.isTerminated()) {
+            executor.shutdownNow();
         }
 
         long duration = System.currentTimeMillis() - startTime;
-        System.out.printf("Finished creating %d accounts in %d ms%n", config.numAccounts, duration);
+        System.out.printf("Finished creating %d accounts in %d ms (errors=%d)%n",
+                processed.get(), duration, creationErrors.get());
     }
 
     private void executeWorkload(int phaseNum) {
