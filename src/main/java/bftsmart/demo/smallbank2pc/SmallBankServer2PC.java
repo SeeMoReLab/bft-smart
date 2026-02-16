@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import bftsmart.demo.util.TimeoutLearningWindowMetrics;
 import bftsmart.rlrpc.LearningAgentGrpc;
 import bftsmart.rlrpc.Report;
 import bftsmart.rlrpc.ReportLocal;
@@ -33,7 +34,6 @@ import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.server.defaultservices.DefaultRecoverable;
 import bftsmart.tom.util.FailureInjectionCliArgs;
 import bftsmart.tom.util.FailureInjectionController;
-import bftsmart.tom.util.Storage;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 
@@ -58,7 +58,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     private boolean logPrinted = false;
 
     /* Adaptive timers */
-    private Storage consensusLatency;
+    private TimeoutLearningWindowMetrics learningMetrics;
     // Legacy snapshot field kept for backward compatibility.
     private long iterations = 0;
     private int lastProcessedConsensusId = -1;
@@ -237,7 +237,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         this.accounts = new HashMap<>();
         this.checking = new HashMap<>();
         this.savings = new HashMap<>();
-        this.consensusLatency = new Storage(EPISODE_LENGTH);
+        this.learningMetrics = new TimeoutLearningWindowMetrics(EPISODE_LENGTH);
 
         if (configHome != null) {
             replica = new ServiceReplica(shardId, replicaId, configHome, this, this);
@@ -266,6 +266,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     @Override
     public byte[][] appExecuteBatch(byte[][] commands, MessageContext[] msgCtx, boolean fromConsensus) {
         byte[][] replies = new byte[commands.length][];
+        Map<Integer, Integer> batchSizesByConsensus = buildBatchSizesByConsensus(msgCtx);
         int index = 0;
         for (byte[] command : commands) {
             MessageContext currentMsgCtx = (msgCtx != null) ? msgCtx[index] : null;
@@ -282,11 +283,8 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                     lastProcessedConsensusId = consensusId;
                     int offsetInEpisode = Math.floorMod(consensusId, EPISODE_LENGTH);
                     int episode = Math.floorDiv(consensusId, EPISODE_LENGTH) + 1;
-
-                    if (currentMsgCtx.getFirstInBatch() != null) {
-                        consensusLatency.store(currentMsgCtx.getFirstInBatch().decisionTime
-                                - currentMsgCtx.getFirstInBatch().consensusStartTime);
-                    }
+                    int batchSize = batchSizesByConsensus.getOrDefault(consensusId, 1);
+                    learningMetrics.recordConsensus(currentMsgCtx, batchSize, currentTimeoutMs);
                     if (offsetInEpisode == REPORT_TRIGGER_OFFSET) {
                         if (learning) {
                             sendStateReport(episode);
@@ -294,10 +292,10 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                         }
                     } else if (offsetInEpisode == APPLY_TRIGGER_OFFSET) {
                         applyTimeoutIfReady(episode);
-                        consensusLatency.reset();
+                        learningMetrics.reset();
                     } else if (offsetInEpisode == EPISODE_END_OFFSET) {
                         captureReward(episode);
-                        consensusLatency.reset();
+                        learningMetrics.reset();
                     }
                 }
             }
@@ -802,17 +800,22 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     }
 
     private Report buildReportFromStorage() {
-        int sampleCount = consensusLatency.getCount();
-        if (sampleCount == 0) {
-            return null;
+        return learningMetrics.buildReport();
+    }
+
+    private Map<Integer, Integer> buildBatchSizesByConsensus(MessageContext[] msgCtx) {
+        Map<Integer, Integer> batchSizesByConsensus = new HashMap<>();
+        if (msgCtx == null) {
+            return batchSizesByConsensus;
         }
-        return Report.newBuilder()
-                .setProcessedTransactions(sampleCount)
-                .setAvgMessageDelay((float) (consensusLatency.getAverage(false) / 1_000_000.0))
-                .setMaxMessageDelay((float) (consensusLatency.getMax(false) / 1_000_000.0))
-                .setMinMessageDelay((float) (consensusLatency.getMin(false) / 1_000_000.0))
-                .setStdMessageDelay((float) (consensusLatency.getDP(true) / 1_000_000.0))
-                .build();
+        for (MessageContext ctx : msgCtx) {
+            if (ctx == null) {
+                continue;
+            }
+            int consensusId = ctx.getConsensusId();
+            batchSizesByConsensus.put(consensusId, batchSizesByConsensus.getOrDefault(consensusId, 0) + 1);
+        }
+        return batchSizesByConsensus;
     }
 
     private void sendStateReport(int episode) {
