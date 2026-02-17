@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -73,7 +74,9 @@ public class SmallBankClient {
             System.out.println("Workload file: " + configFile);
             System.out.println("Client ID: " + clientId);
             if (startUnixMs != null) {
-                System.out.println("Benchmark start unix ms: " + startUnixMs);
+                System.out.println("Benchmark start unix ms: " + startUnixMs + " (" + formatEpochMs(startUnixMs) + ")");
+            } else {
+                System.out.println("Benchmark start unix ms: not set (execute starts immediately)");
             }
             System.out.println(SINGLE_LINE);
 
@@ -172,8 +175,10 @@ public class SmallBankClient {
         }
 
         long duration = System.currentTimeMillis() - startTime;
+        long finishUnixMs = startTime + duration;
         logger.info("Finished creating {} accounts in {} ms (errors={})",
                 processed.get(), duration, creationErrors.get());
+        System.out.println("Account creation finished at unix ms: " + finishUnixMs + " (" + formatEpochMs(finishUnixMs) + ")");
     }
 
     private void executeWorkload() {
@@ -637,6 +642,10 @@ public class SmallBankClient {
             throw new IllegalArgumentException("--start-unix-ms must be >= 0");
         }
         return parsed;
+    }
+
+    private static String formatEpochMs(long epochMs) {
+        return Instant.ofEpochMilli(epochMs).toString();
     }
 
     private static void waitUntilStartUnixMs(Long startUnixMs) {

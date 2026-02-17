@@ -50,6 +50,8 @@ public class SmallBankServer extends DefaultRecoverable {
     private ServiceReplica replica;
     private ManagedChannel learnerChannel;
     private LearningAgentGrpc.LearningAgentBlockingStub learnerStub;
+    private String learnerHost;
+    private int learnerPort = -1;
     private final Object pollerLock = new Object();
     private Thread timeoutPollerThread;
     private volatile boolean pollerStopRequested = false;
@@ -451,16 +453,18 @@ public class SmallBankServer extends DefaultRecoverable {
             return;
         }
         int replicaId = replica.getReplicaContext().getStaticConfiguration().getProcessId();
-        String host = replica.getReplicaContext().getStaticConfiguration().getHost(replicaId);
-        int port = replica.getReplicaContext().getStaticConfiguration().getLearnerPort(replicaId);
-        if (port <= 0) {
+        learnerHost = replica.getReplicaContext().getStaticConfiguration().getHost(replicaId);
+        learnerPort = replica.getReplicaContext().getStaticConfiguration().getLearnerPort(replicaId);
+        if (learnerPort <= 0) {
             System.out.println("Learner port not configured for replica " + replicaId + ". Reports will not be sent.");
             return;
         }
-        learnerChannel = ManagedChannelBuilder.forAddress(host, port)
+        learnerChannel = ManagedChannelBuilder.forAddress(learnerHost, learnerPort)
                 .usePlaintext()
                 .build();
         learnerStub = LearningAgentGrpc.newBlockingStub(learnerChannel);
+        System.out.println(
+                "[learning] replica " + replicaId + " learner target " + learnerHost + ":" + learnerPort);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 learnerChannel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
@@ -494,10 +498,14 @@ public class SmallBankServer extends DefaultRecoverable {
             return;
         }
         if (learnerStub == null) {
+            System.out.println(
+                    "[learning] episode " + episode + " skipped report: learner stub not initialized");
             return;
         }
         Report report = buildReportFromStorage();
         if (report == null) {
+            System.out.println(
+                    "[learning] episode " + episode + " skipped report: metrics report unavailable");
             return;
         }
         ReportLocal.Builder localBuilder = ReportLocal.newBuilder()
@@ -516,11 +524,17 @@ public class SmallBankServer extends DefaultRecoverable {
 
         try {
             learnerStub.sendReport(localBuilder.build());
+            System.out.println(
+                    "[learning] sent report: replica=" + replica.getId()
+                            + " episode=" + episode
+                            + " target=" + learnerHost + ":" + learnerPort);
             if (pendingRewardReport != null) {
                 pendingRewardReport = null;
             }
         } catch (Exception e) {
-            System.out.println("Exception in sending report to agent: " + e.getMessage());
+            System.out.println(
+                    "Exception in sending report to agent (" + learnerHost + ":" + learnerPort + "): "
+                            + e.getMessage());
         }
     }
 

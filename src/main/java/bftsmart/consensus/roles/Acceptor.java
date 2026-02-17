@@ -220,17 +220,28 @@ public final class Acceptor {
 			if (cid == tomLayer.getLastExec() + 1) {
 				tomLayer.setInExec(cid);
 			}
-			epoch.deserializedPropValue = tomLayer.checkProposedValue(value, true);
+				epoch.deserializedPropValue = tomLayer.checkProposedValue(value, true);
 
-			if (epoch.deserializedPropValue != null && !epoch.isWriteSent()) {
-				if (epoch.getConsensus().getDecision().firstMessageProposed == null) {
-					epoch.getConsensus().getDecision().firstMessageProposed = epoch.deserializedPropValue[0];
-				}
-				if (epoch.getConsensus().getDecision().firstMessageProposed.consensusStartTime == 0) {
-					epoch.getConsensus().getDecision().firstMessageProposed.consensusStartTime = consensusStartTime;
+				if (epoch.deserializedPropValue != null && !epoch.isWriteSent()) {
+					// Always bind timing fields to the deserialized first request that will be
+					// delivered to the application. For the leader, firstMessageProposed may
+					// initially point to a different object from TOMLayer#createPropose.
+					TOMMessage previousFirst = epoch.getConsensus().getDecision().firstMessageProposed;
+					TOMMessage deliveredFirst = epoch.deserializedPropValue[0];
+					if (previousFirst != null) {
+						if (deliveredFirst.receptionTime == 0 && previousFirst.receptionTime > 0) {
+							deliveredFirst.receptionTime = previousFirst.receptionTime;
+						}
+						if (deliveredFirst.receptionTimestamp == 0 && previousFirst.receptionTimestamp > 0) {
+							deliveredFirst.receptionTimestamp = previousFirst.receptionTimestamp;
+						}
+					}
+					epoch.getConsensus().getDecision().firstMessageProposed = deliveredFirst;
 
-				}
-				epoch.getConsensus().getDecision().firstMessageProposed.proposeReceivedTime = System.nanoTime();
+					if (deliveredFirst.consensusStartTime == 0) {
+						deliveredFirst.consensusStartTime = consensusStartTime;
+					}
+					deliveredFirst.proposeReceivedTime = System.nanoTime();
 
 				if (controller.getStaticConf().isBFT()) {
 					logger.debug("Sending WRITE for " + cid);
