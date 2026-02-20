@@ -46,6 +46,10 @@ public final class FailureInjectionController {
     private static final String TAG_AT_TIME = "atTime";
     private static final String TAG_AT_TIME_MS = "atTimeMs";
     private static final String TAG_TIME = "time";
+    private static final String TAG_WARM_UP_TIME = "warmUpTime";
+    private static final String TAG_WARM_UP_TIME_MS = "warmUpTimeMs";
+    private static final String TAG_LEADER_FAILURE_INTERVAL = "leaderFailureInterval";
+    private static final String TAG_LEADER_FAILURE_INTERVAL_MS = "leaderFailureIntervalMs";
 
     private static final AtomicInteger lastLoggedPhase = new AtomicInteger(Integer.MIN_VALUE);
     private static volatile Config config = Config.disabled();
@@ -69,13 +73,21 @@ public final class FailureInjectionController {
             throw new IllegalArgumentException("Failure injection spec is not a file: " + specPath);
         }
 
-        List<PhaseRule> phases = parsePhases(path.toFile());
+        Document document = parseDocument(path.toFile());
+        Element root = document.getDocumentElement();
+        if (root == null) {
+            throw new IllegalArgumentException("Invalid failure injection spec: missing root element");
+        }
 
-        config = new Config(true, path.toAbsolutePath().toString(), startUnixMs, phases);
+        long warmUpMs = readWarmUpMs(root);
+        long leaderFailureIntervalMs = readLeaderFailureIntervalMs(root);
+        List<PhaseRule> phases = parsePhases(root);
+
+        config = new Config(true, path.toAbsolutePath().toString(), startUnixMs, warmUpMs, leaderFailureIntervalMs, phases);
         lastLoggedPhase.set(Integer.MIN_VALUE);
 
-        logger.info("Failure injection enabled: spec={}, startUnixMs={}, phaseCount={}",
-                config.specPath, config.startUnixMs, config.phases.size());
+        logger.info("Failure injection enabled: spec={}, startUnixMs={}, warmUpMs={}, leaderFailureIntervalMs={}, phaseCount={}",
+                config.specPath, config.startUnixMs, config.warmUpMs, config.leaderFailureIntervalMs, config.phases.size());
     }
 
     public static void disable() {
@@ -89,9 +101,10 @@ public final class FailureInjectionController {
             return 0;
         }
 
-        long elapsedMs = System.currentTimeMillis() - snapshot.startUnixMs;
-        int activePhaseIndex = findActivePhase(snapshot.phases, elapsedMs);
-        logPhaseChange(snapshot, activePhaseIndex, elapsedMs);
+        long elapsedSinceStartMs = System.currentTimeMillis() - snapshot.startUnixMs;
+        long elapsedSinceWarmUpMs = elapsedSinceStartMs - snapshot.warmUpMs;
+        int activePhaseIndex = findActivePhase(snapshot.phases, elapsedSinceWarmUpMs);
+        logPhaseChange(snapshot, activePhaseIndex, elapsedSinceStartMs, elapsedSinceWarmUpMs);
 
         if (activePhaseIndex < 0) {
             return 0;
@@ -99,6 +112,27 @@ public final class FailureInjectionController {
 
         Integer delayMs = snapshot.phases.get(activePhaseIndex).replicaProposalDelayMs.get(replicaId);
         return delayMs == null ? 0 : delayMs;
+    }
+
+    public static long getLeaderFailureIntervalMs() {
+        Config snapshot = config;
+        if (!snapshot.enabled) {
+            return 0L;
+        }
+        return snapshot.leaderFailureIntervalMs;
+    }
+
+    public static long getLeaderFailureStartUnixMs() {
+        Config snapshot = config;
+        if (!snapshot.enabled) {
+            return -1L;
+        }
+        return safeAdd(snapshot.startUnixMs, snapshot.warmUpMs);
+    }
+
+    public static boolean isLeaderFailureEnabled() {
+        Config snapshot = config;
+        return snapshot.enabled && snapshot.leaderFailureIntervalMs > 0;
     }
 
     private static int findActivePhase(List<PhaseRule> phases, long elapsedMs) {
@@ -118,7 +152,7 @@ public final class FailureInjectionController {
         return active;
     }
 
-    private static void logPhaseChange(Config snapshot, int activePhaseIndex, long elapsedMs) {
+    private static void logPhaseChange(Config snapshot, int activePhaseIndex, long elapsedSinceStartMs, long elapsedSinceWarmUpMs) {
         int previous = lastLoggedPhase.get();
         if (previous == activePhaseIndex) {
             return;
@@ -128,22 +162,17 @@ public final class FailureInjectionController {
         }
 
         if (activePhaseIndex < 0) {
-            logger.info("Failure injection phase changed: inactive (elapsedMs={})", elapsedMs);
+            logger.info("Failure injection phase changed: inactive (elapsedSinceStartMs={}, elapsedSinceWarmUpMs={})",
+                    elapsedSinceStartMs, elapsedSinceWarmUpMs);
             return;
         }
 
         PhaseRule phaseRule = snapshot.phases.get(activePhaseIndex);
-        logger.info("Failure injection phase changed: index={}, startOffsetMs={}, elapsedMs={}",
-                activePhaseIndex, phaseRule.startOffsetMs, elapsedMs);
+        logger.info("Failure injection phase changed: index={}, startOffsetMs(afterWarmUp)={}, elapsedSinceStartMs={}, elapsedSinceWarmUpMs={}",
+                activePhaseIndex, phaseRule.startOffsetMs, elapsedSinceStartMs, elapsedSinceWarmUpMs);
     }
 
-    private static List<PhaseRule> parsePhases(File specFile) {
-        Document document = parseDocument(specFile);
-        Element root = document.getDocumentElement();
-        if (root == null) {
-            return Collections.emptyList();
-        }
-
+    private static List<PhaseRule> parsePhases(Element root) {
         Element phasesElement = findDirectChild(root, TAG_PHASES);
         if (phasesElement == null) {
             return Collections.emptyList();
@@ -165,6 +194,30 @@ public final class FailureInjectionController {
                 .thenComparingInt(p -> p.originalOrder));
 
         return Collections.unmodifiableList(phaseRules);
+    }
+
+    private static long readWarmUpMs(Element root) {
+        Long explicitMs = readLongTag(root, TAG_WARM_UP_TIME_MS);
+        if (explicitMs != null) {
+            return Math.max(0L, explicitMs);
+        }
+        Double seconds = readDoubleTag(root, TAG_WARM_UP_TIME);
+        if (seconds == null) {
+            return 0L;
+        }
+        return Math.max(0L, Math.round(seconds * 1000.0d));
+    }
+
+    private static long readLeaderFailureIntervalMs(Element root) {
+        Long explicitMs = readLongTag(root, TAG_LEADER_FAILURE_INTERVAL_MS);
+        if (explicitMs != null) {
+            return Math.max(0L, explicitMs);
+        }
+        Double seconds = readDoubleTag(root, TAG_LEADER_FAILURE_INTERVAL);
+        if (seconds == null) {
+            return 0L;
+        }
+        return Math.max(0L, Math.round(seconds * 1000.0d));
     }
 
     private static long readPhaseStartOffsetMs(Element phaseElement) {
@@ -358,21 +411,33 @@ public final class FailureInjectionController {
         }
     }
 
+    private static long safeAdd(long left, long right) {
+        if (Long.MAX_VALUE - left < right) {
+            return Long.MAX_VALUE;
+        }
+        return left + right;
+    }
+
     private static final class Config {
         final boolean enabled;
         final String specPath;
         final long startUnixMs;
+        final long warmUpMs;
+        final long leaderFailureIntervalMs;
         final List<PhaseRule> phases;
 
-        private Config(boolean enabled, String specPath, long startUnixMs, List<PhaseRule> phases) {
+        private Config(boolean enabled, String specPath, long startUnixMs, long warmUpMs,
+                       long leaderFailureIntervalMs, List<PhaseRule> phases) {
             this.enabled = enabled;
             this.specPath = specPath;
             this.startUnixMs = startUnixMs;
+            this.warmUpMs = warmUpMs;
+            this.leaderFailureIntervalMs = leaderFailureIntervalMs;
             this.phases = phases;
         }
 
         static Config disabled() {
-            return new Config(false, null, 0L, Collections.<PhaseRule>emptyList());
+            return new Config(false, null, 0L, 0L, 0L, Collections.<PhaseRule>emptyList());
         }
     }
 

@@ -15,11 +15,15 @@
 
     <schemaVersion>2</schemaVersion>
     <replicaIdType>global</replicaIdType>
+    <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
+    <warmUpTime>10</warmUpTime>
+    <!-- Force leader failure / view-change interval in seconds, starting after warm-up. -->
+    <leaderFailureInterval>30</leaderFailureInterval>
 
     <phases>
         <phase>
-            <!-- Activate this phase at t=0 seconds from experiment start -->
-            <atTime>10</atTime>
+            <!-- Activate this phase at t=0 seconds after warm-up (i.e., start + warmUpTime). -->
+            <atTime>0</atTime>
 
             <network>
                 <directedEdges>true</directedEdges>
