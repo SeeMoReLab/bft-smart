@@ -16,7 +16,10 @@ import java.util.concurrent.TimeUnit;
 
 import bftsmart.demo.util.TimeoutLearningWindowMetrics;
 import bftsmart.rlrpc.LearningAgentGrpc;
-import bftsmart.rlrpc.Report;
+import bftsmart.rlrpc.PbftReport;
+import bftsmart.rlrpc.PbftReward;
+import bftsmart.rlrpc.PbftTimeout;
+import bftsmart.rlrpc.Protocol;
 import bftsmart.rlrpc.ReportLocal;
 import bftsmart.rlrpc.Reward;
 import bftsmart.rlrpc.TimeoutRequest;
@@ -59,7 +62,7 @@ public class SmallBankServer extends DefaultRecoverable {
     private volatile int pollerEpisode = -1;
     private int currentTimeoutMs;
     private int lastTimeoutUsedMs;
-    private Report pendingRewardReport;
+    private PbftReport pendingRewardReport;
     private int pendingRewardEpisode;
     private int pendingRewardTimeoutMs;
     private final boolean learning;
@@ -474,7 +477,7 @@ public class SmallBankServer extends DefaultRecoverable {
         }));
     }
 
-    private Report buildReportFromStorage() {
+    private PbftReport buildReportFromStorage() {
         return learningMetrics.buildReport();
     }
 
@@ -502,7 +505,7 @@ public class SmallBankServer extends DefaultRecoverable {
                     "[learning] episode " + episode + " skipped report: learner stub not initialized");
             return;
         }
-        Report report = buildReportFromStorage();
+        PbftReport report = buildReportFromStorage();
         if (report == null) {
             System.out.println(
                     "[learning] episode " + episode + " skipped report: metrics report unavailable");
@@ -511,13 +514,19 @@ public class SmallBankServer extends DefaultRecoverable {
         ReportLocal.Builder localBuilder = ReportLocal.newBuilder()
                 .setNodeId(replica.getId())
                 .setEpisode(episode)
-                .setState(report);
+                .setProtocol(Protocol.PROTOCOL_PBFT)
+                .setPbftState(report);
 
         if (pendingRewardReport != null) {
-            Reward reward = Reward.newBuilder()
+            PbftReward pbftReward = PbftReward.newBuilder()
                     .setEpisode(pendingRewardEpisode)
                     .setReport(pendingRewardReport)
-                    .setTimeoutMillisecondsUsed(pendingRewardTimeoutMs)
+                    .setTimeoutUsed(PbftTimeout.newBuilder()
+                            .setElectionTimeoutMilliseconds(Math.max(0, pendingRewardTimeoutMs))
+                            .build())
+                    .build();
+            Reward reward = Reward.newBuilder()
+                    .setPbft(pbftReward)
                     .build();
             localBuilder.setReward(reward);
         }
@@ -565,6 +574,7 @@ public class SmallBankServer extends DefaultRecoverable {
         }
         TimeoutRequest request = TimeoutRequest.newBuilder()
                 .setEpisode(episode)
+                .setProtocol(Protocol.PROTOCOL_PBFT)
                 .build();
         while (true) {
             if (pollerStopRequested || pollerEpisode != episode) {
@@ -572,9 +582,12 @@ public class SmallBankServer extends DefaultRecoverable {
             }
             try {
                 TimeoutStatus status = learnerStub.getTimeout(request);
-                if (status.getStatus() == TimeoutStatus.Status.READY && status.hasTimeout()) {
+                if (status.getStatus() == TimeoutStatus.Status.READY
+                        && status.hasTimeout()
+                        && status.getTimeout().hasPbft()) {
                     if (!pollerStopRequested && pollerEpisode == episode) {
-                        pollerRecommendationMs = (int) status.getTimeout().getTimeoutMilliseconds();
+                        pollerRecommendationMs = (int) status.getTimeout().getPbft()
+                                .getElectionTimeoutMilliseconds();
                     }
                     return;
                 }
@@ -613,7 +626,7 @@ public class SmallBankServer extends DefaultRecoverable {
         if (!learning) {
             return;
         }
-        Report rewardReport = buildReportFromStorage();
+        PbftReport rewardReport = buildReportFromStorage();
         if (rewardReport == null) {
             return;
         }

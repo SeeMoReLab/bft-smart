@@ -1,8 +1,11 @@
 package bftsmart.tom.core;
 
 import bftsmart.demo.smallbank2pc.SmallBankMessage2PC;
+import bftsmart.rlrpc.PbftReport;
+import bftsmart.rlrpc.TwoPcOverPbftReport;
 import bftsmart.tom.ServiceProxy;
 import bftsmart.tom.core.messages.TOMMessage;
+import bftsmart.tom.util.Storage;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,6 +23,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public class ShardHandler {
     private static final Logger logger = LoggerFactory.getLogger(ShardHandler.class);
+    private static final double NS_TO_MS = 1_000_000.0;
 
     // Base client ID for cross-shard proxies
     private static final int BASE_CROSS_SHARD_CLIENT_ID = 8000;
@@ -43,6 +47,37 @@ public class ShardHandler {
     private final ExecutorService executor;
 
     private int timeoutMs = 5000; // Timeout for cross-shard requests
+
+    private enum PrepareFailureReason {
+        LOCK_BUSY,
+        VALIDATION_FAIL,
+        TIMEOUT,
+        OTHER
+    }
+
+    private final Object learningMetricsLock = new Object();
+    private final Storage endToEndLatencyNs = new Storage(4096);
+    private final Storage prepareLatencyNs = new Storage(4096);
+    private final Storage commitLatencyNs = new Storage(4096);
+    private final Storage lockWaitNs = new Storage(4096);
+    private final Storage lockHoldNs = new Storage(4096);
+    private long crossShardTransactions = 0;
+    private long prepareOkCount = 0;
+    private long prepareFailCount = 0;
+    private long commitOkCount = 0;
+    private long abortCount = 0;
+    private long inDoubtCount = 0;
+    private long prepareTimeoutCount = 0;
+    private long commitTimeoutUnknownOutcomeCount = 0;
+    private long abortBestEffortTimeoutCount = 0;
+    private long lockContentionCount = 0;
+    private long reasonPrepareLockBusyCount = 0;
+    private long reasonPrepareValidationFailCount = 0;
+    private long reasonPrepareTimeoutCount = 0;
+    private long reasonPrepareOtherCount = 0;
+    private long reasonCommitTimeoutUnknownOutcomeCount = 0;
+    private long reasonAbortBestEffortTimeoutCount = 0;
+    private long reasonOtherCount = 0;
 
     public enum ConnectionState {
         NOT_CONNECTED,
@@ -197,8 +232,9 @@ public class ShardHandler {
     }
 
     private void handleCrossShardSendPayment(SmallBankMessage2PC request, TOMMessage msg, TOMLayer tomLayer) {
-        // Generate a single transaction ID shared across the entire 2PC lifecycle
         String txId = String.format("2pc-%d-%d-%d", shardId, System.currentTimeMillis(), System.nanoTime());
+        long txStartNs = System.nanoTime();
+        recordCrossShardTransaction();
 
         int senderShard = getShardForAccount(request.getCustomerId());
         int receiverShard = getShardForAccount(request.getDestCustomerId());
@@ -208,16 +244,15 @@ public class ShardHandler {
 
         ServiceProxy senderProxy = getOrCreateProxy(senderShard);
         ServiceProxy receiverProxy = getOrCreateProxy(receiverShard);
-
         if (senderProxy == null || receiverProxy == null) {
             logger.error("Failed to get proxies for 2PC: senderProxy={}, receiverProxy={}",
                     senderProxy != null ? "OK" : "null", receiverProxy != null ? "OK" : "null");
+            recordAbortWithoutPrepare(txStartNs);
             sendReplyToClient(msg, tomLayer,
                     SmallBankMessage2PC.newErrorMessage("Failed to connect to participant shards"));
             return;
         }
 
-        // Phase 1: PREPARE
         SmallBankMessage2PC senderPrepare = SmallBankMessage2PC.newPrepareRequest(
                 txId, shardId, senderShard,
                 SmallBankMessage2PC.TransactionType.WRITE_CHECK,
@@ -227,41 +262,42 @@ public class ShardHandler {
                 SmallBankMessage2PC.TransactionType.DEPOSIT_CHECKING,
                 request.getDestCustomerId(), request.getAmount());
 
-        // Send PREPAREs in parallel
+        long prepareStartNs = System.nanoTime();
         Future<byte[]> senderFuture = executor.submit(() -> senderProxy.invokeOrdered(senderPrepare.getBytes()));
         Future<byte[]> receiverFuture = executor.submit(() -> receiverProxy.invokeOrdered(receiverPrepare.getBytes()));
 
-        byte[] senderReply, receiverReply;
+        byte[] senderReply;
+        byte[] receiverReply;
         try {
             senderReply = senderFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
             receiverReply = receiverFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             logger.error("Timeout/error during PREPARE phase for txId={}", txId, e);
-            // Best-effort abort on both shards
+            recordPrepareFailure(PrepareFailureReason.TIMEOUT, System.nanoTime() - prepareStartNs, txStartNs);
             abortBestEffort(txId, senderProxy, receiverProxy);
             sendReplyToClient(msg, tomLayer,
                     SmallBankMessage2PC.newErrorMessage("2PC prepare timeout"));
             return;
         }
 
-        // Check prepare replies
         SmallBankMessage2PC senderResp = SmallBankMessage2PC.getObject(senderReply);
         SmallBankMessage2PC receiverResp = SmallBankMessage2PC.getObject(receiverReply);
         boolean senderOk = senderResp != null && senderResp.getResult() == 0;
         boolean receiverOk = receiverResp != null && receiverResp.getResult() == 0;
+        long prepareLatencyNs = System.nanoTime() - prepareStartNs;
 
         if (!senderOk || !receiverOk) {
             logger.info("PREPARE failed for txId={}: sender={}, receiver={}", txId,
                     senderOk ? "OK" : (senderResp != null ? senderResp.getErrorMsg() : "null"),
                     receiverOk ? "OK" : (receiverResp != null ? receiverResp.getErrorMsg() : "null"));
-            // Send ABORTs with the same txId so servers can find and release locks
+            recordPrepareFailure(classifyPrepareFailure(senderResp, receiverResp), prepareLatencyNs, txStartNs);
             abortBestEffort(txId, senderProxy, receiverProxy);
             sendReplyToClient(msg, tomLayer,
                     SmallBankMessage2PC.newErrorMessage("2PC prepare failed"));
             return;
         }
+        recordPrepareSuccess(prepareLatencyNs);
 
-        // Phase 2: COMMIT — use the same txId so servers match to the prepared transaction
         logger.info("All PREPAREs successful for txId={}, sending COMMITs", txId);
         SmallBankMessage2PC senderCommit = SmallBankMessage2PC.newCommitWithDetails(
                 txId, shardId,
@@ -272,6 +308,7 @@ public class ShardHandler {
                 SmallBankMessage2PC.TransactionType.DEPOSIT_CHECKING,
                 request.getDestCustomerId(), request.getAmount());
 
+        long commitStartNs = System.nanoTime();
         Future<byte[]> senderCommitFuture = executor.submit(() -> senderProxy.invokeOrdered(senderCommit.getBytes()));
         Future<byte[]> receiverCommitFuture = executor.submit(() -> receiverProxy.invokeOrdered(receiverCommit.getBytes()));
 
@@ -280,18 +317,21 @@ public class ShardHandler {
             receiverCommitFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             logger.error("Timeout/error during COMMIT phase for txId={}", txId, e);
+            recordCommitTimeoutUnknownOutcome(System.nanoTime() - commitStartNs, txStartNs);
             sendReplyToClient(msg, tomLayer,
                     SmallBankMessage2PC.newErrorMessage("2PC commit timeout"));
             return;
         }
 
         logger.info("2PC COMMIT successful for txId={}", txId);
+        recordCommitSuccess(System.nanoTime() - commitStartNs, txStartNs);
         sendReplyToClient(msg, tomLayer, SmallBankMessage2PC.newResponse(0));
     }
 
     private void handleCrossShardAmalgamate(SmallBankMessage2PC request, TOMMessage msg, TOMLayer tomLayer) {
-        // Generate a single transaction ID shared across the entire 2PC lifecycle
         String txId = String.format("2pc-%d-%d-%d", shardId, System.currentTimeMillis(), System.nanoTime());
+        long txStartNs = System.nanoTime();
+        recordCrossShardTransaction();
 
         int destShard = getShardForAccount(request.getCustomerId());
         int sourceShard = getShardForAccount(request.getDestCustomerId());
@@ -301,16 +341,15 @@ public class ShardHandler {
 
         ServiceProxy destProxy = getOrCreateProxy(destShard);
         ServiceProxy sourceProxy = getOrCreateProxy(sourceShard);
-
         if (destProxy == null || sourceProxy == null) {
             logger.error("Failed to get proxies for 2PC: destProxy={}, sourceProxy={}",
                     destProxy != null ? "OK" : "null", sourceProxy != null ? "OK" : "null");
+            recordAbortWithoutPrepare(txStartNs);
             sendReplyToClient(msg, tomLayer,
                     SmallBankMessage2PC.newErrorMessage("Failed to connect to participant shards"));
             return;
         }
 
-        // Phase 1: PREPARE
         SmallBankMessage2PC destPrepare = SmallBankMessage2PC.newPrepareRequest(
                 txId, shardId, destShard,
                 SmallBankMessage2PC.TransactionType.TRANSACT_SAVINGS,
@@ -320,41 +359,42 @@ public class ShardHandler {
                 SmallBankMessage2PC.TransactionType.WRITE_CHECK,
                 request.getDestCustomerId(), request.getAmount());
 
-        // Send PREPAREs
+        long prepareStartNs = System.nanoTime();
         Future<byte[]> destFuture = executor.submit(() -> destProxy.invokeOrdered(destPrepare.getBytes()));
         Future<byte[]> sourceFuture = executor.submit(() -> sourceProxy.invokeOrdered(sourcePrepare.getBytes()));
 
-        byte[] destReply, sourceReply;
+        byte[] destReply;
+        byte[] sourceReply;
         try {
             destReply = destFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
             sourceReply = sourceFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             logger.error("Timeout/error during PREPARE phase for txId={}", txId, e);
-            // Best-effort abort on both shards
+            recordPrepareFailure(PrepareFailureReason.TIMEOUT, System.nanoTime() - prepareStartNs, txStartNs);
             abortBestEffort(txId, destProxy, sourceProxy);
             sendReplyToClient(msg, tomLayer,
                     SmallBankMessage2PC.newErrorMessage("2PC prepare timeout"));
             return;
         }
 
-        // Check prepare replies
         SmallBankMessage2PC destResp = SmallBankMessage2PC.getObject(destReply);
         SmallBankMessage2PC sourceResp = SmallBankMessage2PC.getObject(sourceReply);
         boolean destOk = destResp != null && destResp.getResult() == 0;
         boolean sourceOk = sourceResp != null && sourceResp.getResult() == 0;
+        long prepareLatencyNs = System.nanoTime() - prepareStartNs;
 
         if (!destOk || !sourceOk) {
             logger.info("PREPARE failed for txId={}: dest={}, source={}", txId,
                     destOk ? "OK" : (destResp != null ? destResp.getErrorMsg() : "null"),
                     sourceOk ? "OK" : (sourceResp != null ? sourceResp.getErrorMsg() : "null"));
-            // Send ABORTs with the same txId so servers can find and release locks
+            recordPrepareFailure(classifyPrepareFailure(destResp, sourceResp), prepareLatencyNs, txStartNs);
             abortBestEffort(txId, destProxy, sourceProxy);
             sendReplyToClient(msg, tomLayer,
                     SmallBankMessage2PC.newErrorMessage("2PC prepare failed"));
             return;
         }
+        recordPrepareSuccess(prepareLatencyNs);
 
-        // Phase 2: COMMIT
         logger.info("All PREPAREs successful for txId={}, sending COMMITs", txId);
         SmallBankMessage2PC destCommit = SmallBankMessage2PC.newCommitWithDetails(
                 txId, shardId,
@@ -365,6 +405,7 @@ public class ShardHandler {
                 SmallBankMessage2PC.TransactionType.WRITE_CHECK,
                 request.getDestCustomerId(), request.getAmount());
 
+        long commitStartNs = System.nanoTime();
         Future<byte[]> destCommitFuture = executor.submit(() -> destProxy.invokeOrdered(destCommit.getBytes()));
         Future<byte[]> sourceCommitFuture = executor.submit(() -> sourceProxy.invokeOrdered(sourceCommit.getBytes()));
 
@@ -373,12 +414,14 @@ public class ShardHandler {
             sourceCommitFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             logger.error("Timeout/error during COMMIT phase for txId={}", txId, e);
+            recordCommitTimeoutUnknownOutcome(System.nanoTime() - commitStartNs, txStartNs);
             sendReplyToClient(msg, tomLayer,
                     SmallBankMessage2PC.newErrorMessage("2PC commit timeout"));
             return;
         }
 
         logger.info("2PC COMMIT successful for txId={}", txId);
+        recordCommitSuccess(System.nanoTime() - commitStartNs, txStartNs);
         sendReplyToClient(msg, tomLayer, SmallBankMessage2PC.newResponse(0));
     }
 
@@ -403,6 +446,7 @@ public class ShardHandler {
             receiverAbort.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             logger.warn("Timeout waiting for ABORT completion for txId={}: {}", txId, e.getMessage());
+            recordAbortBestEffortTimeout();
         }
     }
 
@@ -418,6 +462,238 @@ public class ShardHandler {
         );
         tomLayer.getCommunication().send(new int[]{originalMsg.getSender()}, replyMsg);
         logger.debug("Sent 2PC reply to client {}: result={}", originalMsg.getSender(), response.getResult());
+    }
+
+    public void recordParticipantLockWaitNanos(long durationNs) {
+        if (durationNs <= 0) {
+            return;
+        }
+        synchronized (learningMetricsLock) {
+            lockWaitNs.store(durationNs);
+        }
+    }
+
+    public void recordParticipantLockHoldMillis(long durationMs) {
+        if (durationMs <= 0) {
+            return;
+        }
+        synchronized (learningMetricsLock) {
+            lockHoldNs.store(durationMs * 1_000_000L);
+        }
+    }
+
+    public void recordParticipantLockContention() {
+        synchronized (learningMetricsLock) {
+            lockContentionCount = safeAdd(lockContentionCount, 1);
+        }
+    }
+
+    public TwoPcOverPbftReport buildTwoPcOverPbftReport(PbftReport pbftReport, int singleShardTransactions) {
+        if (pbftReport == null) {
+            return null;
+        }
+
+        synchronized (learningMetricsLock) {
+            long safeSingleShard = Math.max(0, singleShardTransactions);
+            long safeCrossShard = Math.max(0, crossShardTransactions);
+            long totalTransactions = safeAdd(safeSingleShard, safeCrossShard);
+            double denominator = safeCrossShard > 0 ? safeCrossShard : 1.0;
+
+            return TwoPcOverPbftReport.newBuilder()
+                    .setPbft(pbftReport)
+                    .setTotalTransactions(saturatingInt(totalTransactions))
+                    .setSingleShardTransactions(saturatingInt(safeSingleShard))
+                    .setCrossShardTransactions(saturatingInt(safeCrossShard))
+                    .setPrepareOkCount(saturatingInt(prepareOkCount))
+                    .setPrepareFailCount(saturatingInt(prepareFailCount))
+                    .setCommitOkCount(saturatingInt(commitOkCount))
+                    .setAbortCount(saturatingInt(abortCount))
+                    .setInDoubtCount(saturatingInt(inDoubtCount))
+                    .setPrepareTimeoutCount(saturatingInt(prepareTimeoutCount))
+                    .setCommitTimeoutUnknownOutcomeCount(saturatingInt(commitTimeoutUnknownOutcomeCount))
+                    .setAbortBestEffortTimeoutCount(saturatingInt(abortBestEffortTimeoutCount))
+                    .setLockContentionCount(saturatingInt(lockContentionCount))
+                    .setPrepareTimeoutRate((float) (prepareTimeoutCount / denominator))
+                    .setAbortRate((float) (abortCount / denominator))
+                    .setCommitRate((float) (commitOkCount / denominator))
+                    .setLockContentionRate((float) (lockContentionCount / denominator))
+                    .setAvgEndToEndLatencyMs(averageMs(endToEndLatencyNs))
+                    .setP95EndToEndLatencyMs(percentileMs(endToEndLatencyNs, 0.95))
+                    .setP99EndToEndLatencyMs(percentileMs(endToEndLatencyNs, 0.99))
+                    .setAvgPrepareLatencyMs(averageMs(prepareLatencyNs))
+                    .setP95PrepareLatencyMs(percentileMs(prepareLatencyNs, 0.95))
+                    .setAvgCommitLatencyMs(averageMs(commitLatencyNs))
+                    .setP95CommitLatencyMs(percentileMs(commitLatencyNs, 0.95))
+                    .setAvgLockWaitMs(averageMs(lockWaitNs))
+                    .setP95LockWaitMs(percentileMs(lockWaitNs, 0.95))
+                    .setAvgLockHoldMs(averageMs(lockHoldNs))
+                    .setP95LockHoldMs(percentileMs(lockHoldNs, 0.95))
+                    .setReasonPrepareLockBusyCount(saturatingInt(reasonPrepareLockBusyCount))
+                    .setReasonPrepareValidationFailCount(saturatingInt(reasonPrepareValidationFailCount))
+                    .setReasonPrepareTimeoutCount(saturatingInt(reasonPrepareTimeoutCount))
+                    .setReasonPrepareOtherCount(saturatingInt(reasonPrepareOtherCount))
+                    .setReasonCommitTimeoutUnknownOutcomeCount(saturatingInt(reasonCommitTimeoutUnknownOutcomeCount))
+                    .setReasonAbortBestEffortTimeoutCount(saturatingInt(reasonAbortBestEffortTimeoutCount))
+                    .setReasonOtherCount(saturatingInt(reasonOtherCount))
+                    .build();
+        }
+    }
+
+    public void resetLearningWindowMetrics() {
+        synchronized (learningMetricsLock) {
+            endToEndLatencyNs.reset();
+            prepareLatencyNs.reset();
+            commitLatencyNs.reset();
+            lockWaitNs.reset();
+            lockHoldNs.reset();
+            crossShardTransactions = 0;
+            prepareOkCount = 0;
+            prepareFailCount = 0;
+            commitOkCount = 0;
+            abortCount = 0;
+            inDoubtCount = 0;
+            prepareTimeoutCount = 0;
+            commitTimeoutUnknownOutcomeCount = 0;
+            abortBestEffortTimeoutCount = 0;
+            lockContentionCount = 0;
+            reasonPrepareLockBusyCount = 0;
+            reasonPrepareValidationFailCount = 0;
+            reasonPrepareTimeoutCount = 0;
+            reasonPrepareOtherCount = 0;
+            reasonCommitTimeoutUnknownOutcomeCount = 0;
+            reasonAbortBestEffortTimeoutCount = 0;
+            reasonOtherCount = 0;
+        }
+    }
+
+    private void recordCrossShardTransaction() {
+        synchronized (learningMetricsLock) {
+            crossShardTransactions = safeAdd(crossShardTransactions, 1);
+        }
+    }
+
+    private void recordPrepareSuccess(long prepareDurationNs) {
+        synchronized (learningMetricsLock) {
+            prepareOkCount = safeAdd(prepareOkCount, 1);
+            storeIfPositive(prepareLatencyNs, prepareDurationNs);
+        }
+    }
+
+    private void recordPrepareFailure(PrepareFailureReason reason, long prepareDurationNs, long txStartNs) {
+        synchronized (learningMetricsLock) {
+            prepareFailCount = safeAdd(prepareFailCount, 1);
+            abortCount = safeAdd(abortCount, 1);
+            storeIfPositive(prepareLatencyNs, prepareDurationNs);
+            storeIfPositive(endToEndLatencyNs, System.nanoTime() - txStartNs);
+            switch (reason) {
+                case LOCK_BUSY:
+                    reasonPrepareLockBusyCount = safeAdd(reasonPrepareLockBusyCount, 1);
+                    break;
+                case VALIDATION_FAIL:
+                    reasonPrepareValidationFailCount = safeAdd(reasonPrepareValidationFailCount, 1);
+                    break;
+                case TIMEOUT:
+                    prepareTimeoutCount = safeAdd(prepareTimeoutCount, 1);
+                    reasonPrepareTimeoutCount = safeAdd(reasonPrepareTimeoutCount, 1);
+                    break;
+                default:
+                    reasonPrepareOtherCount = safeAdd(reasonPrepareOtherCount, 1);
+                    break;
+            }
+        }
+    }
+
+    private void recordAbortWithoutPrepare(long txStartNs) {
+        synchronized (learningMetricsLock) {
+            abortCount = safeAdd(abortCount, 1);
+            reasonOtherCount = safeAdd(reasonOtherCount, 1);
+            storeIfPositive(endToEndLatencyNs, System.nanoTime() - txStartNs);
+        }
+    }
+
+    private void recordCommitSuccess(long commitDurationNs, long txStartNs) {
+        synchronized (learningMetricsLock) {
+            commitOkCount = safeAdd(commitOkCount, 1);
+            storeIfPositive(commitLatencyNs, commitDurationNs);
+            storeIfPositive(endToEndLatencyNs, System.nanoTime() - txStartNs);
+        }
+    }
+
+    private void recordCommitTimeoutUnknownOutcome(long commitDurationNs, long txStartNs) {
+        synchronized (learningMetricsLock) {
+            inDoubtCount = safeAdd(inDoubtCount, 1);
+            commitTimeoutUnknownOutcomeCount = safeAdd(commitTimeoutUnknownOutcomeCount, 1);
+            reasonCommitTimeoutUnknownOutcomeCount = safeAdd(reasonCommitTimeoutUnknownOutcomeCount, 1);
+            storeIfPositive(commitLatencyNs, commitDurationNs);
+            storeIfPositive(endToEndLatencyNs, System.nanoTime() - txStartNs);
+        }
+    }
+
+    private void recordAbortBestEffortTimeout() {
+        synchronized (learningMetricsLock) {
+            abortBestEffortTimeoutCount = safeAdd(abortBestEffortTimeoutCount, 1);
+            reasonAbortBestEffortTimeoutCount = safeAdd(reasonAbortBestEffortTimeoutCount, 1);
+        }
+    }
+
+    private static PrepareFailureReason classifyPrepareFailure(SmallBankMessage2PC first, SmallBankMessage2PC second) {
+        String firstError = first != null ? first.getErrorMsg() : null;
+        String secondError = second != null ? second.getErrorMsg() : null;
+        if (containsIgnoreCase(firstError, "lock") || containsIgnoreCase(secondError, "lock")
+                || containsIgnoreCase(firstError, "busy") || containsIgnoreCase(secondError, "busy")) {
+            return PrepareFailureReason.LOCK_BUSY;
+        }
+        if (containsIgnoreCase(firstError, "insufficient")
+                || containsIgnoreCase(secondError, "insufficient")
+                || containsIgnoreCase(firstError, "account")
+                || containsIgnoreCase(secondError, "account")) {
+            return PrepareFailureReason.VALIDATION_FAIL;
+        }
+        if (firstError != null || secondError != null) {
+            return PrepareFailureReason.OTHER;
+        }
+        return PrepareFailureReason.OTHER;
+    }
+
+    private static boolean containsIgnoreCase(String text, String token) {
+        return text != null && text.toLowerCase(Locale.ROOT).contains(token);
+    }
+
+    private static long safeAdd(long left, long right) {
+        if (Long.MAX_VALUE - left < right) {
+            return Long.MAX_VALUE;
+        }
+        return left + right;
+    }
+
+    private static int saturatingInt(long value) {
+        if (value <= 0L) {
+            return 0;
+        }
+        if (value >= Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        return (int) value;
+    }
+
+    private static void storeIfPositive(Storage storage, long valueNs) {
+        if (valueNs > 0L) {
+            storage.store(valueNs);
+        }
+    }
+
+    private static float averageMs(Storage storage) {
+        if (storage.getCount() == 0) {
+            return 0f;
+        }
+        return (float) (storage.getAverage(false) / NS_TO_MS);
+    }
+
+    private static float percentileMs(Storage storage, double percentile) {
+        if (storage.getCount() == 0) {
+            return 0f;
+        }
+        return (float) (storage.getPercentile(percentile) / NS_TO_MS);
     }
 
     // Proxy Management
@@ -585,6 +861,10 @@ public class ShardHandler {
 
     public void setTimeoutMs(int timeoutMs) {
         this.timeoutMs = timeoutMs;
+    }
+
+    public int getTimeoutMs() {
+        return timeoutMs;
     }
 
     // Util

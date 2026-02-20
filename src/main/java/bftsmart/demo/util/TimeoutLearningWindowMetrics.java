@@ -1,6 +1,6 @@
 package bftsmart.demo.util;
 
-import bftsmart.rlrpc.Report;
+import bftsmart.rlrpc.PbftReport;
 import bftsmart.tom.MessageContext;
 import bftsmart.tom.core.messages.TOMMessage;
 import bftsmart.tom.util.Storage;
@@ -22,7 +22,6 @@ public class TimeoutLearningWindowMetrics {
     private long totalTransactions;
     private int totalConsensus;
     private int timeoutViolationCount;
-    private int noOpCount;
     private int leaderChangeCount;
     private int regencyChangeCount;
     private Integer previousLeader;
@@ -49,7 +48,6 @@ public class TimeoutLearningWindowMetrics {
         totalTransactions = 0L;
         totalConsensus = 0;
         timeoutViolationCount = 0;
-        noOpCount = 0;
         leaderChangeCount = 0;
         regencyChangeCount = 0;
         firstDecisionTimeNs = -1L;
@@ -62,9 +60,6 @@ public class TimeoutLearningWindowMetrics {
         }
 
         totalConsensus++;
-        if (context.isNoOp()) {
-            noOpCount++;
-        }
 
         int safeBatchSize = Math.max(consensusBatchSize, 0);
         totalTransactions += safeBatchSize;
@@ -103,31 +98,32 @@ public class TimeoutLearningWindowMetrics {
         storeIfValid(postDecisionDelayNs, postDecision);
     }
 
-    public Report buildReport() {
+    public PbftReport buildReport() {
         int latencySamples = consensusLatencyNs.getCount();
         if (latencySamples == 0) {
             return null;
         }
 
-        Report.Builder builder = Report.newBuilder()
-                .setProcessedTransactions(saturatingInt(totalTransactions))
-                .setAvgMessageDelay(toMs(consensusLatencyNs.getAverage(false)))
-                .setMaxMessageDelay(toMs(consensusLatencyNs.getMax(false)))
-                .setMinMessageDelay(toMs(consensusLatencyNs.getMin(false)))
-                .setStdMessageDelay(toMs(consensusLatencyNs.getDP(true)))
-                .setP95MessageDelay(toMs(consensusLatencyNs.getPercentile(0.95)))
-                .setP99MessageDelay(toMs(consensusLatencyNs.getPercentile(0.99)))
+        PbftReport.Builder builder = PbftReport.newBuilder()
+                .setTotalTransactions(saturatingInt(totalTransactions))
+                .setTotalConsensusInstances(totalConsensus)
+                .setAvgConsensusLatencyMs(toMs(consensusLatencyNs.getAverage(false)))
+                .setP95ConsensusLatencyMs(toMs(consensusLatencyNs.getPercentile(0.95)))
+                .setP99ConsensusLatencyMs(toMs(consensusLatencyNs.getPercentile(0.99)))
                 .setThroughputTps(computeThroughputTps())
                 .setTimeoutViolationRate(totalConsensus > 0 ? (float) timeoutViolationCount / totalConsensus : 0f)
-                .setNoOpRate(totalConsensus > 0 ? (float) noOpCount / totalConsensus : 0f)
                 .setAvgBatchSize(totalConsensus > 0 ? (float) totalTransactions / totalConsensus : 0f)
                 .setP95BatchSize(batchSize.getCount() > 0 ? batchSize.getPercentile(0.95) : 0f)
                 .setLeaderChangeCount(leaderChangeCount)
                 .setRegencyChangeCount(regencyChangeCount)
-                .setAvgProposeDelay(averageMs(proposeDelayNs))
-                .setAvgWriteDelay(averageMs(writeDelayNs))
-                .setAvgAcceptDelay(averageMs(acceptDelayNs))
-                .setAvgPostDecisionDelay(averageMs(postDecisionDelayNs));
+                .setPhaseProposeAvgDelayMs(averageMs(proposeDelayNs))
+                .setPhaseProposeP95DelayMs(percentileMs(proposeDelayNs, 0.95))
+                .setPhaseWriteAvgDelayMs(averageMs(writeDelayNs))
+                .setPhaseWriteP95DelayMs(percentileMs(writeDelayNs, 0.95))
+                .setPhaseAcceptAvgDelayMs(averageMs(acceptDelayNs))
+                .setPhaseAcceptP95DelayMs(percentileMs(acceptDelayNs, 0.95))
+                .setPhasePostDecisionAvgDelayMs(averageMs(postDecisionDelayNs))
+                .setPhasePostDecisionP95DelayMs(percentileMs(postDecisionDelayNs, 0.95));
 
         return builder.build();
     }
@@ -186,6 +182,13 @@ public class TimeoutLearningWindowMetrics {
             return 0f;
         }
         return toMs(storage.getAverage(false));
+    }
+
+    private static float percentileMs(Storage storage, double percentile) {
+        if (storage.getCount() == 0) {
+            return 0f;
+        }
+        return toMs(storage.getPercentile(percentile));
     }
 
     private static float toMs(double nanoseconds) {

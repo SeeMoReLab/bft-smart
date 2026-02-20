@@ -1,7 +1,8 @@
 package bftsmart.demo.dataexchange;
 
-import bftsmart.rlrpc.Report;
 import bftsmart.rlrpc.ReportBatch;
+import bftsmart.rlrpc.PbftReport;
+import bftsmart.rlrpc.Protocol;
 import bftsmart.rlrpc.ReportLocal;
 import bftsmart.rlrpc.ConsensusGrpc;
 import com.google.protobuf.Empty;
@@ -46,7 +47,8 @@ public class DataExchangeClient {
 
     private static ReportBatch buildReportBatch(int episode, int reports) {
         ReportBatch.Builder builder = ReportBatch.newBuilder()
-                .setEpisode(episode);
+                .setEpisode(episode)
+                .setProtocol(Protocol.PROTOCOL_PBFT);
 
         for (int i = 0; i < reports; i++) {
             builder.addReports(buildReportLocal(episode, i + 1));
@@ -58,18 +60,25 @@ public class DataExchangeClient {
         return ReportLocal.newBuilder()
                 .setNodeId(nodeId)
                 .setEpisode(episode)
-                .setState(randomReport())
+                .setProtocol(Protocol.PROTOCOL_PBFT)
+                .setPbftState(randomReport())
                 .build();
     }
 
-    private static Report randomReport() {
+    private static PbftReport randomReport() {
         ThreadLocalRandom rnd = ThreadLocalRandom.current();
-        return Report.newBuilder()
-                .setProcessedTransactions(rnd.nextInt(1, 10_000))
-                .setAvgMessageDelay(rnd.nextFloat() * 100)
-                .setMaxMessageDelay(rnd.nextFloat() * 200)
-                .setMinMessageDelay(rnd.nextFloat() * 10)
-                .setStdMessageDelay(rnd.nextFloat() * 50)
+        int tx = rnd.nextInt(1, 10_000);
+        int consensus = Math.max(1, tx / 10);
+        return PbftReport.newBuilder()
+                .setTotalTransactions(tx)
+                .setTotalConsensusInstances(consensus)
+                .setAvgConsensusLatencyMs(rnd.nextFloat() * 50)
+                .setP95ConsensusLatencyMs(rnd.nextFloat() * 75)
+                .setP99ConsensusLatencyMs(rnd.nextFloat() * 100)
+                .setThroughputTps(rnd.nextFloat() * 5_000)
+                .setTimeoutViolationRate(rnd.nextFloat())
+                .setAvgBatchSize((float) tx / consensus)
+                .setP95BatchSize(rnd.nextFloat() * 32)
                 .build();
     }
 }

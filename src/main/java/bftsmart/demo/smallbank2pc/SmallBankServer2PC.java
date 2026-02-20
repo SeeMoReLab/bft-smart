@@ -23,14 +23,19 @@ import org.slf4j.LoggerFactory;
 
 import bftsmart.demo.util.TimeoutLearningWindowMetrics;
 import bftsmart.rlrpc.LearningAgentGrpc;
-import bftsmart.rlrpc.Report;
-import bftsmart.rlrpc.ReportLocal;
+import bftsmart.rlrpc.PbftReport;
+import bftsmart.rlrpc.Protocol;
 import bftsmart.rlrpc.Reward;
+import bftsmart.rlrpc.ReportLocal;
 import bftsmart.rlrpc.TimeoutRequest;
 import bftsmart.rlrpc.TimeoutStatus;
+import bftsmart.rlrpc.TwoPcOverPbftReport;
+import bftsmart.rlrpc.TwoPcOverPbftReward;
+import bftsmart.rlrpc.TwoPcOverPbftTimeout;
 import bftsmart.tom.MessageContext;
 import bftsmart.tom.ReplicaContext;
 import bftsmart.tom.ServiceReplica;
+import bftsmart.tom.core.ShardHandler;
 import bftsmart.tom.server.defaultservices.DefaultRecoverable;
 import bftsmart.tom.util.FailureInjectionCliArgs;
 import bftsmart.tom.util.FailureInjectionController;
@@ -72,9 +77,10 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     private volatile int pollerEpisode = -1;
     private int currentTimeoutMs = -1;
     private int lastTimeoutUsedMs = -1;
-    private Report pendingRewardReport;
+    private TwoPcOverPbftReport pendingRewardReport;
     private int pendingRewardEpisode;
     private int pendingRewardTimeoutMs;
+    private int singleShardTransactionCount;
     private final boolean learning;
 
     // Shard configuration (for logging/debugging)
@@ -292,10 +298,10 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                         }
                     } else if (offsetInEpisode == APPLY_TRIGGER_OFFSET) {
                         applyTimeoutIfReady(episode);
-                        learningMetrics.reset();
+                        resetWindowMetrics();
                     } else if (offsetInEpisode == EPISODE_END_OFFSET) {
                         captureReward(episode);
-                        learningMetrics.reset();
+                        resetWindowMetrics();
                     }
                 }
             }
@@ -319,6 +325,8 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                     replies[index++] = reply.getBytes();
                     continue;
                 }
+
+                singleShardTransactionCount++;
 
                 // Regular transaction processing
                 switch (request.getTxType()) {
@@ -548,7 +556,11 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         Set<Long> accountsToLock = getAccountsToLock(request);
 
         // Try to acquire locks
-        if (!tryAcquireLocks(accountsToLock)) {
+        long lockWaitStartNs = System.nanoTime();
+        boolean lockAcquired = tryAcquireLocks(accountsToLock);
+        recordParticipantLockWait(System.nanoTime() - lockWaitStartNs);
+        if (!lockAcquired) {
+            recordParticipantLockContention();
             logger.info("Cannot acquire locks for transaction {}, accounts {} are locked", txId, accountsToLock);
             return SmallBankMessage2PC.newPrepareFail(txId, "Cannot acquire locks - accounts busy");
         }
@@ -605,6 +617,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             ? request.getAmount() : pending.amount;
 
         executeTransaction(txType, customerId, amount);
+        recordParticipantLockHold(pending);
 
         // Release locks
         releaseLocks(pending.lockedAccountIds);
@@ -663,6 +676,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         }
 
         // Just release locks - no changes to apply
+        recordParticipantLockHold(pending);
         releaseLocks(pending.lockedAccountIds);
 
         logger.info("ABORT successful for txId={}", txId);
@@ -799,8 +813,21 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         logger.info("LearningAgent client configured for {}:{}", host, port);
     }
 
-    private Report buildReportFromStorage() {
-        return learningMetrics.buildReport();
+    private TwoPcOverPbftReport buildReportFromStorage() {
+        PbftReport pbftReport = learningMetrics.buildReport();
+        if (pbftReport == null) {
+            return null;
+        }
+        ShardHandler shardHandler = replica != null ? replica.getShardHandler() : null;
+        if (shardHandler == null) {
+            return TwoPcOverPbftReport.newBuilder()
+                    .setPbft(pbftReport)
+                    .setTotalTransactions(Math.max(singleShardTransactionCount, 0))
+                    .setSingleShardTransactions(Math.max(singleShardTransactionCount, 0))
+                    .setCrossShardTransactions(0)
+                    .build();
+        }
+        return shardHandler.buildTwoPcOverPbftReport(pbftReport, singleShardTransactionCount);
     }
 
     private Map<Integer, Integer> buildBatchSizesByConsensus(MessageContext[] msgCtx) {
@@ -825,7 +852,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         if (learnerStub == null) {
             return;
         }
-        Report report = buildReportFromStorage();
+        TwoPcOverPbftReport report = buildReportFromStorage();
         if (report == null) {
             return;
         }
@@ -833,13 +860,21 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         ReportLocal.Builder localBuilder = ReportLocal.newBuilder()
                 .setNodeId(nodeId)
                 .setEpisode(episode)
-                .setState(report);
+                .setProtocol(Protocol.PROTOCOL_TWO_PC_OVER_PBFT)
+                .setTwoPcOverPbftState(report);
 
         if (pendingRewardReport != null) {
-            Reward reward = Reward.newBuilder()
+            int prepareTimeoutMs = getPrepareTimeoutMs();
+            TwoPcOverPbftReward twoPcReward = TwoPcOverPbftReward.newBuilder()
                     .setEpisode(pendingRewardEpisode)
                     .setReport(pendingRewardReport)
-                    .setTimeoutMillisecondsUsed(pendingRewardTimeoutMs)
+                    .setTimeoutUsed(TwoPcOverPbftTimeout.newBuilder()
+                            .setElectionTimeoutMilliseconds(Math.max(0, pendingRewardTimeoutMs))
+                            .setPrepareTimeoutMilliseconds(Math.max(0, prepareTimeoutMs))
+                            .build())
+                    .build();
+            Reward reward = Reward.newBuilder()
+                    .setTwoPcOverPbft(twoPcReward)
                     .build();
             localBuilder.setReward(reward);
         }
@@ -881,6 +916,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         }
         TimeoutRequest request = TimeoutRequest.newBuilder()
                 .setEpisode(episode)
+                .setProtocol(Protocol.PROTOCOL_TWO_PC_OVER_PBFT)
                 .build();
         while (true) {
             if (pollerStopRequested || pollerEpisode != episode) {
@@ -888,9 +924,12 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             }
             try {
                 TimeoutStatus status = learnerStub.getTimeout(request);
-                if (status.getStatus() == TimeoutStatus.Status.READY && status.hasTimeout()) {
+                if (status.getStatus() == TimeoutStatus.Status.READY
+                        && status.hasTimeout()
+                        && status.getTimeout().hasTwoPcOverPbft()) {
                     if (!pollerStopRequested && pollerEpisode == episode) {
-                        pollerRecommendationMs = (int) status.getTimeout().getTimeoutMilliseconds();
+                        pollerRecommendationMs = (int) status.getTimeout().getTwoPcOverPbft()
+                                .getElectionTimeoutMilliseconds();
                     }
                     return;
                 }
@@ -929,12 +968,57 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         if (!learning) {
             return;
         }
-        Report rewardReport = buildReportFromStorage();
+        TwoPcOverPbftReport rewardReport = buildReportFromStorage();
         if (rewardReport == null) {
             return;
         }
         pendingRewardReport = rewardReport;
         pendingRewardEpisode = episode;
         pendingRewardTimeoutMs = lastTimeoutUsedMs;
+    }
+
+    private void resetWindowMetrics() {
+        learningMetrics.reset();
+        singleShardTransactionCount = 0;
+        ShardHandler shardHandler = replica != null ? replica.getShardHandler() : null;
+        if (shardHandler != null) {
+            shardHandler.resetLearningWindowMetrics();
+        }
+    }
+
+    private void recordParticipantLockWait(long durationNs) {
+        ShardHandler shardHandler = replica != null ? replica.getShardHandler() : null;
+        if (shardHandler != null) {
+            shardHandler.recordParticipantLockWaitNanos(durationNs);
+        }
+    }
+
+    private void recordParticipantLockContention() {
+        ShardHandler shardHandler = replica != null ? replica.getShardHandler() : null;
+        if (shardHandler != null) {
+            shardHandler.recordParticipantLockContention();
+        }
+    }
+
+    private void recordParticipantLockHold(PendingTransaction pending) {
+        if (pending == null) {
+            return;
+        }
+        long holdMs = System.currentTimeMillis() - pending.prepareTime;
+        if (holdMs <= 0) {
+            return;
+        }
+        ShardHandler shardHandler = replica != null ? replica.getShardHandler() : null;
+        if (shardHandler != null) {
+            shardHandler.recordParticipantLockHoldMillis(holdMs);
+        }
+    }
+
+    private int getPrepareTimeoutMs() {
+        ShardHandler shardHandler = replica != null ? replica.getShardHandler() : null;
+        if (shardHandler == null) {
+            return 0;
+        }
+        return Math.max(0, shardHandler.getTimeoutMs());
     }
 }
