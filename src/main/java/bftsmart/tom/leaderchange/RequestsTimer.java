@@ -39,6 +39,22 @@ import org.slf4j.LoggerFactory;
  *
  */
 public class RequestsTimer {
+
+    private enum BackoffIncrementMode {
+        LINEAR,
+        EXPONENTIAL
+    }
+
+    private enum BackoffDecayMode {
+        LINEAR,
+        EXPONENTIAL,
+        RESET
+    }
+
+    private enum BackoffDecayTiming {
+        CURRENT_VIEW,
+        NEXT_VIEW
+    }
     
     private Logger logger = LoggerFactory.getLogger(this.getClass());
 
@@ -49,7 +65,14 @@ public class RequestsTimer {
     private long shortTimeout;
     private long backoffMultiplier;
     private boolean timeoutBackoffEnabled;
+    private BackoffIncrementMode backoffIncrementMode;
+    private BackoffDecayMode backoffDecayMode;
+    private BackoffDecayTiming backoffDecayTiming;
+    private int decayAfterSuccessfulSequences;
+    private long successfulSequencesSinceDecay;
+    private long pendingDecaySteps;
     private boolean resetBackoffOnNextViewChange;
+    private final Object backoffLock = new Object();
     private TreeSet<TOMMessage> watched = new TreeSet<TOMMessage>();
     private ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
     
@@ -75,15 +98,29 @@ public class RequestsTimer {
         this.timeout = this.controller.getStaticConf().getRequestTimeout();
         this.backoffMultiplier = 1;
         this.timeoutBackoffEnabled = this.controller.getStaticConf().isRequestTimeoutBackoffEnabled();
+        this.backoffIncrementMode = parseBackoffIncrementMode(this.controller.getStaticConf().getRequestTimeoutBackoffIncrementMode());
+        this.backoffDecayMode = parseBackoffDecayMode(this.controller.getStaticConf().getRequestTimeoutBackoffDecayMode());
+        this.backoffDecayTiming = parseBackoffDecayTiming(this.controller.getStaticConf().getRequestTimeoutBackoffDecayTiming());
+        this.decayAfterSuccessfulSequences = this.controller.getStaticConf().getRequestTimeoutBackoffDecayAfterSuccessfulSequences();
+        this.successfulSequencesSinceDecay = 0;
+        this.pendingDecaySteps = 0;
         this.resetBackoffOnNextViewChange = true;
         this.shortTimeout = -1;
     }
 
     public void setShortTimeout(long shortTimeout) {
-        this.shortTimeout = shortTimeout;
+        synchronized (backoffLock) {
+            this.shortTimeout = shortTimeout;
+        }
     }
 
     public long getTimeout() {
+        synchronized (backoffLock) {
+            return getTimeoutLocked();
+        }
+    }
+
+    private long getTimeoutLocked() {
         long base = (shortTimeout > -1 ? shortTimeout : timeout);
         if (backoffMultiplier <= 1) {
             return base;
@@ -263,29 +300,161 @@ public class RequestsTimer {
     }
 
     public void onViewChangeStarted() {
+        long effectiveTimeout;
+        long multiplier;
 
-        if (!timeoutBackoffEnabled) {
-            backoffMultiplier = 1;
-            resetBackoffOnNextViewChange = true;
-            return;
+        synchronized (backoffLock) {
+            if (!timeoutBackoffEnabled) {
+                resetBackoffStateLocked();
+                return;
+            }
+
+            // Legacy behavior: keep compatibility when no success-based decay policy is configured.
+            if (!isSuccessBasedDecayEnabled()) {
+                if (resetBackoffOnNextViewChange) {
+                    backoffMultiplier = 1;
+                    resetBackoffOnNextViewChange = false;
+                } else {
+                    incrementBackoffMultiplierLocked();
+                }
+            } else {
+                incrementBackoffMultiplierLocked();
+            }
+
+            effectiveTimeout = getTimeoutLocked();
+            multiplier = backoffMultiplier;
         }
 
-        if (resetBackoffOnNextViewChange) {
-            backoffMultiplier = 1;
-            resetBackoffOnNextViewChange = false;
-        } else {
-            long base = (shortTimeout > -1 ? shortTimeout : timeout);
-            long maxMultiplier = (base == 0 ? Long.MAX_VALUE : Long.MAX_VALUE / base);
-            long doubled = backoffMultiplier > (maxMultiplier / 2) ? maxMultiplier : backoffMultiplier * 2;
-            backoffMultiplier = Math.max(1, doubled);
-        }
-
-        logger.info("Using request timeout {} ms for view-change attempt", getTimeout());
+        logger.info("Using request timeout {} ms for view-change attempt (multiplier={})", effectiveTimeout, multiplier);
     }
 
     public void onViewInstalled() {
-        resetBackoffOnNextViewChange = true;
+        synchronized (backoffLock) {
+            if (!timeoutBackoffEnabled) {
+                resetBackoffStateLocked();
+                return;
+            }
+
+            if (!isSuccessBasedDecayEnabled()) {
+                resetBackoffOnNextViewChange = true;
+            } else if (backoffDecayTiming == BackoffDecayTiming.NEXT_VIEW && pendingDecaySteps > 0) {
+                applyDecayStepsLocked(pendingDecaySteps);
+                pendingDecaySteps = 0;
+            }
+        }
+
         logger.info("View installed");
+    }
+
+    public void onSequenceExecuted(int consensusId) {
+        long steps = 0;
+        long multiplierAfter = 1;
+        boolean applyNow = false;
+
+        synchronized (backoffLock) {
+            if (!timeoutBackoffEnabled || !isSuccessBasedDecayEnabled()) {
+                return;
+            }
+
+            successfulSequencesSinceDecay = safeAdd(successfulSequencesSinceDecay, 1);
+            if (successfulSequencesSinceDecay < decayAfterSuccessfulSequences) {
+                return;
+            }
+
+            steps = successfulSequencesSinceDecay / decayAfterSuccessfulSequences;
+            successfulSequencesSinceDecay = successfulSequencesSinceDecay % decayAfterSuccessfulSequences;
+
+            if (backoffDecayTiming == BackoffDecayTiming.CURRENT_VIEW) {
+                applyDecayStepsLocked(steps);
+                applyNow = true;
+            } else {
+                pendingDecaySteps = safeAdd(pendingDecaySteps, steps);
+            }
+
+            multiplierAfter = backoffMultiplier;
+        }
+
+        if (applyNow) {
+            logger.info(
+                    "Applied {} timeout-backoff decay step(s) after successful sequence {}. Multiplier={}",
+                    steps,
+                    consensusId,
+                    multiplierAfter);
+        } else {
+            logger.info(
+                    "Queued {} timeout-backoff decay step(s) after successful sequence {} for next view",
+                    steps,
+                    consensusId);
+        }
+    }
+
+    private boolean isSuccessBasedDecayEnabled() {
+        return decayAfterSuccessfulSequences > 0;
+    }
+
+    private void resetBackoffStateLocked() {
+        backoffMultiplier = 1;
+        resetBackoffOnNextViewChange = true;
+        successfulSequencesSinceDecay = 0;
+        pendingDecaySteps = 0;
+    }
+
+    private void incrementBackoffMultiplierLocked() {
+        long updatedMultiplier;
+        if (backoffIncrementMode == BackoffIncrementMode.LINEAR) {
+            updatedMultiplier = safeAdd(backoffMultiplier, 1);
+        } else {
+            updatedMultiplier = (backoffMultiplier > Long.MAX_VALUE / 2) ? Long.MAX_VALUE : backoffMultiplier * 2;
+        }
+        backoffMultiplier = Math.max(1, updatedMultiplier);
+    }
+
+    private void applyDecayStepsLocked(long steps) {
+        for (long i = 0; i < steps; i++) {
+            if (backoffMultiplier <= 1) {
+                return;
+            }
+
+            if (backoffDecayMode == BackoffDecayMode.LINEAR) {
+                backoffMultiplier = Math.max(1, backoffMultiplier - 1);
+            } else if (backoffDecayMode == BackoffDecayMode.EXPONENTIAL) {
+                backoffMultiplier = Math.max(1, backoffMultiplier / 2);
+            } else {
+                backoffMultiplier = 1;
+                return;
+            }
+        }
+    }
+
+    private long safeAdd(long left, long right) {
+        if (Long.MAX_VALUE - left < right) {
+            return Long.MAX_VALUE;
+        }
+        return left + right;
+    }
+
+    private BackoffIncrementMode parseBackoffIncrementMode(String mode) {
+        if ("linear".equalsIgnoreCase(mode)) {
+            return BackoffIncrementMode.LINEAR;
+        }
+        return BackoffIncrementMode.EXPONENTIAL;
+    }
+
+    private BackoffDecayMode parseBackoffDecayMode(String mode) {
+        if ("linear".equalsIgnoreCase(mode)) {
+            return BackoffDecayMode.LINEAR;
+        }
+        if ("exponential".equalsIgnoreCase(mode)) {
+            return BackoffDecayMode.EXPONENTIAL;
+        }
+        return BackoffDecayMode.RESET;
+    }
+
+    private BackoffDecayTiming parseBackoffDecayTiming(String timing) {
+        if ("current_view".equalsIgnoreCase(timing)) {
+            return BackoffDecayTiming.CURRENT_VIEW;
+        }
+        return BackoffDecayTiming.NEXT_VIEW;
     }
     
     class RequestTimerTask extends TimerTask {

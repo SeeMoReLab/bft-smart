@@ -312,6 +312,10 @@ public final class DeliveryThread extends Thread {
 						lastReconfig = -2;
 					}
 
+					for (Decision decision : decisions) {
+						tomLayer.requestsTimer.onSequenceExecuted(decision.getConsensusId());
+					}
+
 					// define the last stable consensus... the stable consensus can
 					// be removed from the leaderManager and the executionManager
 					// TODO: Is this part necessary? If it is, can we put it

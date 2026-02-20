@@ -66,6 +66,10 @@ public class TOMConfiguration extends Configuration {
     private String bindAddress;
     private int clientInvokeOrderedTimeout;
     private boolean requestTimeoutBackoffEnabled;
+    private String requestTimeoutBackoffIncrementMode;
+    private String requestTimeoutBackoffDecayMode;
+    private int requestTimeoutBackoffDecayAfterSuccessfulSequences;
+    private String requestTimeoutBackoffDecayTiming;
 
     /* Tulio Ribeiro*/
     //private Boolean ssltls=true;
@@ -119,6 +123,55 @@ public class TOMConfiguration extends Configuration {
 
             s = (String) configs.remove("system.totalordermulticast.timeout.backoff");
             requestTimeoutBackoffEnabled = (s != null) ? Boolean.parseBoolean(s) : false;
+
+            s = (String) configs.remove("system.totalordermulticast.timeout.backoff.increment");
+            if (s == null) {
+                requestTimeoutBackoffIncrementMode = "exponential";
+            } else {
+                String normalized = s.trim().toLowerCase();
+                if ("linear".equals(normalized) || "exponential".equals(normalized)) {
+                    requestTimeoutBackoffIncrementMode = normalized;
+                } else {
+                    logger.warn("Invalid timeout backoff increment mode '{}', using exponential", s);
+                    requestTimeoutBackoffIncrementMode = "exponential";
+                }
+            }
+
+            s = (String) configs.remove("system.totalordermulticast.timeout.backoff.decay");
+            if (s == null) {
+                requestTimeoutBackoffDecayMode = "reset";
+            } else {
+                String normalized = s.trim().toLowerCase();
+                if ("linear".equals(normalized) || "exponential".equals(normalized) || "reset".equals(normalized)) {
+                    requestTimeoutBackoffDecayMode = normalized;
+                } else {
+                    logger.warn("Invalid timeout backoff decay mode '{}', using reset", s);
+                    requestTimeoutBackoffDecayMode = "reset";
+                }
+            }
+
+            s = (String) configs.remove("system.totalordermulticast.timeout.backoff.decay.after_successful_sequences");
+            if (s == null) {
+                requestTimeoutBackoffDecayAfterSuccessfulSequences = -1;
+            } else {
+                requestTimeoutBackoffDecayAfterSuccessfulSequences = Integer.parseInt(s);
+                if (requestTimeoutBackoffDecayAfterSuccessfulSequences <= 0) {
+                    requestTimeoutBackoffDecayAfterSuccessfulSequences = -1;
+                }
+            }
+
+            s = (String) configs.remove("system.totalordermulticast.timeout.backoff.decay.timing");
+            if (s == null) {
+                requestTimeoutBackoffDecayTiming = "next_view";
+            } else {
+                String normalized = s.trim().toLowerCase();
+                if ("current_view".equals(normalized) || "next_view".equals(normalized)) {
+                    requestTimeoutBackoffDecayTiming = normalized;
+                } else {
+                    logger.warn("Invalid timeout backoff decay timing '{}', using next_view", s);
+                    requestTimeoutBackoffDecayTiming = "next_view";
+                }
+            }
             
             s = (String) configs.remove("system.totalordermulticast.batchtimeout");
             if (s == null) {
@@ -470,6 +523,22 @@ public class TOMConfiguration extends Configuration {
 
     public boolean isRequestTimeoutBackoffEnabled() {
         return requestTimeoutBackoffEnabled;
+    }
+
+    public String getRequestTimeoutBackoffIncrementMode() {
+        return requestTimeoutBackoffIncrementMode;
+    }
+
+    public String getRequestTimeoutBackoffDecayMode() {
+        return requestTimeoutBackoffDecayMode;
+    }
+
+    public int getRequestTimeoutBackoffDecayAfterSuccessfulSequences() {
+        return requestTimeoutBackoffDecayAfterSuccessfulSequences;
+    }
+
+    public String getRequestTimeoutBackoffDecayTiming() {
+        return requestTimeoutBackoffDecayTiming;
     }
 
     public int getBatchTimeout() {
