@@ -45,10 +45,9 @@ import io.grpc.ManagedChannelBuilder;
 public class SmallBankServer2PC extends DefaultRecoverable {
     private static final Logger logger = LoggerFactory.getLogger(SmallBankServer2PC.class);
     private static final boolean _debug = false;
-    private static final int EPISODE_LENGTH = 1000;
-    private static final int REPORT_TRIGGER_OFFSET = 499;
-    private static final int APPLY_TRIGGER_OFFSET = 799;
-    private static final int EPISODE_END_OFFSET = 999;
+    private static final int REPORT_TICK_INTERVAL = 10;
+    private static final long REPORT_TRIGGER_ELAPSED_MS = 5000L;
+    private static final int MAX_REPORT_LENGTH = 500;
     private static final int POLL_INTERVAL_MS = 50;
 
     // Account data
@@ -73,7 +72,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     private final Object pollerLock = new Object();
     private Thread timeoutPollerThread;
     private volatile boolean pollerStopRequested = false;
-    private volatile Integer pollerRecommendationMs = null;
+    private volatile TimeoutDecision pollerDecision = null;
     private volatile int pollerEpisode = -1;
     private int currentTimeoutMs = -1;
     private int lastTimeoutUsedMs = -1;
@@ -88,6 +87,48 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     private int myReplicaId;
     private int myShardId;
     private int totalShards;
+
+    private int currentEpisode = 1;
+    private int episodeStartTick = 0;
+    private long episodeStartWallClockMs = -1L;
+    private boolean reportSentForEpisode = false;
+    private boolean reachedReportCapForEpisode = false;
+    private int capApplyDeadlineTick = -1;
+    private int capRewardDeadlineTick = -1;
+    private EpisodeWindow selectedWindow = null;
+    private boolean applyHandledForEpisode = false;
+    private boolean rewardCapturedForEpisode = false;
+    private boolean waitingForRecommendation = false;
+
+    private static final class TimeoutDecision {
+        private final int timeoutMs;
+        private final int startTick;
+        private final int reportSeq;
+        private final int reportLength;
+
+        private TimeoutDecision(int timeoutMs, int startTick, int reportSeq, int reportLength) {
+            this.timeoutMs = timeoutMs;
+            this.startTick = startTick;
+            this.reportSeq = reportSeq;
+            this.reportLength = reportLength;
+        }
+    }
+
+    private static final class EpisodeWindow {
+        private final int startTick;
+        private final int reportSeq;
+        private final int reportLength;
+        private final int applyTick;
+        private final int rewardTick;
+
+        private EpisodeWindow(int startTick, int reportSeq, int reportLength) {
+            this.startTick = startTick;
+            this.reportSeq = reportSeq;
+            this.reportLength = reportLength;
+            this.applyTick = reportSeq + (reportLength / 2);
+            this.rewardTick = reportSeq + reportLength;
+        }
+    }
 
     /**
      * Represents a transaction that has been prepared but not yet committed/aborted.
@@ -243,7 +284,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         this.accounts = new HashMap<>();
         this.checking = new HashMap<>();
         this.savings = new HashMap<>();
-        this.learningMetrics = new TimeoutLearningWindowMetrics(EPISODE_LENGTH);
+        this.learningMetrics = new TimeoutLearningWindowMetrics(MAX_REPORT_LENGTH * 2);
 
         if (configHome != null) {
             replica = new ServiceReplica(shardId, replicaId, configHome, this, this);
@@ -287,22 +328,8 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                 int consensusId = currentMsgCtx.getConsensusId();
                 if (consensusId > lastProcessedConsensusId) {
                     lastProcessedConsensusId = consensusId;
-                    int offsetInEpisode = Math.floorMod(consensusId, EPISODE_LENGTH);
-                    int episode = Math.floorDiv(consensusId, EPISODE_LENGTH) + 1;
                     int batchSize = batchSizesByConsensus.getOrDefault(consensusId, 1);
-                    learningMetrics.recordConsensus(currentMsgCtx, batchSize, currentTimeoutMs);
-                    if (offsetInEpisode == REPORT_TRIGGER_OFFSET) {
-                        if (learning) {
-                            sendStateReport(episode);
-                            startTimeoutPolling(episode);
-                        }
-                    } else if (offsetInEpisode == APPLY_TRIGGER_OFFSET) {
-                        applyTimeoutIfReady(episode);
-                        resetWindowMetrics();
-                    } else if (offsetInEpisode == EPISODE_END_OFFSET) {
-                        captureReward(episode);
-                        resetWindowMetrics();
-                    }
+                    handleConsensusProgress(consensusId, currentMsgCtx, batchSize);
                 }
             }
 
@@ -845,11 +872,140 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         return batchSizesByConsensus;
     }
 
-    private void sendStateReport(int episode) {
-        if (!learning) {
+    private void handleConsensusProgress(int consensusId, MessageContext context, int batchSize) {
+        learningMetrics.recordConsensus(context, batchSize, currentTimeoutMs);
+        if (episodeStartWallClockMs < 0L) {
+            episodeStartWallClockMs = System.currentTimeMillis();
+            episodeStartTick = consensusId;
+        }
+        maybeConsumeRecommendation(consensusId);
+        if (consensusId % REPORT_TICK_INTERVAL == 0) {
+            maybeSendReportTick(consensusId);
+        }
+        maybeHandleApplyDeadline(consensusId);
+        maybeHandleRewardDeadline(consensusId);
+    }
+
+    private void maybeSendReportTick(int consensusId) {
+        if (!learning || learnerStub == null) {
             return;
         }
-        if (learnerStub == null) {
+        if (selectedWindow != null || reachedReportCapForEpisode) {
+            return;
+        }
+        int reportLength = consensusId - episodeStartTick;
+        if (reportLength <= 0) {
+            return;
+        }
+        long elapsedMs = System.currentTimeMillis() - episodeStartWallClockMs;
+        boolean shouldSendInitial = !reportSentForEpisode
+                && (elapsedMs >= REPORT_TRIGGER_ELAPSED_MS || reportLength >= MAX_REPORT_LENGTH);
+        boolean shouldSendFollowup = reportSentForEpisode && waitingForRecommendation;
+        if (!shouldSendInitial && !shouldSendFollowup) {
+            return;
+        }
+
+        int effectiveReportLength = Math.min(reportLength, MAX_REPORT_LENGTH);
+        int reportSeq = episodeStartTick + effectiveReportLength;
+        sendStateReport(currentEpisode, episodeStartTick, reportSeq);
+        reportSentForEpisode = true;
+        waitingForRecommendation = true;
+        maybeStartTimeoutPolling(currentEpisode);
+
+        if (effectiveReportLength >= MAX_REPORT_LENGTH) {
+            reachedReportCapForEpisode = true;
+            EpisodeWindow capWindow = new EpisodeWindow(episodeStartTick, reportSeq, effectiveReportLength);
+            capApplyDeadlineTick = capWindow.applyTick;
+            capRewardDeadlineTick = capWindow.rewardTick;
+        }
+    }
+
+    private void maybeConsumeRecommendation(int consensusId) {
+        if (!learning || selectedWindow != null) {
+            return;
+        }
+        TimeoutDecision decision = pollerDecision;
+        if (decision == null || pollerEpisode != currentEpisode) {
+            return;
+        }
+        selectedWindow = new EpisodeWindow(decision.startTick, decision.reportSeq, decision.reportLength);
+        waitingForRecommendation = false;
+        stopTimeoutPolling();
+        if (consensusId > selectedWindow.applyTick) {
+            applyHandledForEpisode = true;
+            lastTimeoutUsedMs = currentTimeoutMs;
+            logger.info(
+                    "[learning] ignored late recommendation: episode={} report_seq={} apply_tick={} current_cid={}",
+                    currentEpisode,
+                    selectedWindow.reportSeq,
+                    selectedWindow.applyTick,
+                    consensusId
+            );
+        }
+    }
+
+    private void maybeHandleApplyDeadline(int consensusId) {
+        if (applyHandledForEpisode) {
+            return;
+        }
+        if (selectedWindow != null) {
+            if (consensusId < selectedWindow.applyTick) {
+                return;
+            }
+            if (consensusId == selectedWindow.applyTick && pollerDecision != null) {
+                currentTimeoutMs = pollerDecision.timeoutMs;
+                replica.getRequestsTimer().setShortTimeout(currentTimeoutMs);
+            }
+            applyHandledForEpisode = true;
+            lastTimeoutUsedMs = currentTimeoutMs;
+            return;
+        }
+        if (reachedReportCapForEpisode && capApplyDeadlineTick >= 0 && consensusId >= capApplyDeadlineTick) {
+            waitingForRecommendation = false;
+            applyHandledForEpisode = true;
+            lastTimeoutUsedMs = currentTimeoutMs;
+            stopTimeoutPolling();
+        }
+    }
+
+    private void maybeHandleRewardDeadline(int consensusId) {
+        if (rewardCapturedForEpisode) {
+            return;
+        }
+        int rewardDeadline = -1;
+        if (selectedWindow != null) {
+            rewardDeadline = selectedWindow.rewardTick;
+        } else if (reachedReportCapForEpisode && capRewardDeadlineTick >= 0) {
+            rewardDeadline = capRewardDeadlineTick;
+        }
+        if (rewardDeadline < 0 || consensusId < rewardDeadline) {
+            return;
+        }
+        captureReward(currentEpisode);
+        rewardCapturedForEpisode = true;
+        stopTimeoutPolling();
+        startNextEpisode(consensusId);
+    }
+
+    private void startNextEpisode(int startTick) {
+        currentEpisode++;
+        episodeStartTick = startTick;
+        episodeStartWallClockMs = System.currentTimeMillis();
+        reportSentForEpisode = false;
+        reachedReportCapForEpisode = false;
+        capApplyDeadlineTick = -1;
+        capRewardDeadlineTick = -1;
+        selectedWindow = null;
+        applyHandledForEpisode = false;
+        rewardCapturedForEpisode = false;
+        waitingForRecommendation = false;
+        pollerDecision = null;
+        pollerEpisode = -1;
+        resetWindowMetrics();
+    }
+
+    private void sendStateReport(int episode, int startTick, int reportSeq) {
+        if (!learning || learnerStub == null) {
             return;
         }
         TwoPcOverPbftReport report = buildReportFromStorage();
@@ -861,6 +1017,8 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                 .setNodeId(nodeId)
                 .setEpisode(episode)
                 .setProtocol(Protocol.PROTOCOL_TWO_PC_OVER_PBFT)
+                .setStartTick(startTick)
+                .setReportSeq(reportSeq)
                 .setTwoPcOverPbftState(report);
 
         if (pendingRewardReport != null) {
@@ -889,24 +1047,35 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         }
     }
 
-    private void startTimeoutPolling(int episode) {
-        if (!learning) {
-            return;
-        }
-        if (learnerStub == null) {
+    private void maybeStartTimeoutPolling(int episode) {
+        if (!learning || learnerStub == null) {
             return;
         }
         synchronized (pollerLock) {
+            if (pollerEpisode == episode
+                    && timeoutPollerThread != null
+                    && timeoutPollerThread.isAlive()) {
+                return;
+            }
             pollerStopRequested = true;
             if (timeoutPollerThread != null) {
                 timeoutPollerThread.interrupt();
             }
             pollerStopRequested = false;
-            pollerRecommendationMs = null;
+            pollerDecision = null;
             pollerEpisode = episode;
             timeoutPollerThread = new Thread(() -> pollForTimeout(episode));
             timeoutPollerThread.setDaemon(true);
             timeoutPollerThread.start();
+        }
+    }
+
+    private void stopTimeoutPolling() {
+        synchronized (pollerLock) {
+            pollerStopRequested = true;
+            if (timeoutPollerThread != null) {
+                timeoutPollerThread.interrupt();
+            }
         }
     }
 
@@ -927,11 +1096,16 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                 if (status.getStatus() == TimeoutStatus.Status.READY
                         && status.hasTimeout()
                         && status.getTimeout().hasTwoPcOverPbft()) {
-                    if (!pollerStopRequested && pollerEpisode == episode) {
-                        pollerRecommendationMs = (int) status.getTimeout().getTwoPcOverPbft()
-                                .getElectionTimeoutMilliseconds();
+                    int timeoutMs = (int) status.getTimeout().getTwoPcOverPbft()
+                            .getElectionTimeoutMilliseconds();
+                    int startTick = (int) status.getStartTick();
+                    int reportSeq = (int) status.getReportSeq();
+                    int reportLength = reportSeq - startTick;
+                    if (reportSeq > startTick && reportLength > 0
+                            && !pollerStopRequested && pollerEpisode == episode) {
+                        pollerDecision = new TimeoutDecision(timeoutMs, startTick, reportSeq, reportLength);
+                        return;
                     }
-                    return;
                 }
             } catch (Exception e) {
                 logger.warn("Exception while polling timeout: {}", e.getMessage());
@@ -943,25 +1117,6 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                 return;
             }
         }
-    }
-
-    private void applyTimeoutIfReady(int episode) {
-        if (!learning) {
-            lastTimeoutUsedMs = currentTimeoutMs;
-            return;
-        }
-        synchronized (pollerLock) {
-            pollerStopRequested = true;
-            if (timeoutPollerThread != null) {
-                timeoutPollerThread.interrupt();
-            }
-        }
-        Integer recommendation = pollerRecommendationMs;
-        if (recommendation != null && pollerEpisode == episode) {
-            currentTimeoutMs = recommendation;
-            replica.getRequestsTimer().setShortTimeout(currentTimeoutMs);
-        }
-        lastTimeoutUsedMs = currentTimeoutMs;
     }
 
     private void captureReward(int episode) {
