@@ -21,7 +21,8 @@
 
             <!-- Target transactions per second PER TERMINAL -->
             <!-- Total TPS = rate * terminals -->
-            <rate>30</rate>
+            <!-- rate=0 enables SATURATE mode (no rate limiting) -->
+            <rate>0</rate>
 
             <!-- Transaction mix weights (must sum to 100) -->
             <!-- Order: DepositChecking, TransactSavings, WriteCheck, SendPayment, Amalgamate, Balance -->

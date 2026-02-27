@@ -261,7 +261,8 @@ public class SmallBankClient {
         RandomDistribution.Flat accountRng = new RandomDistribution.Flat(new Random(seed ^ 0x9E3779B97F4A7C15L),
                 0, config.numAccounts);
 
-        long intervalNs = (long) (1_000_000_000.0 / window.rate);
+        boolean saturate = window.rate == 0.0;
+        long intervalNs = saturate ? 0L : Math.max(1L, (long) (1_000_000_000.0 / window.rate));
         long nextTransactionTime = window.startNs;
         int txCount = 0;
 
@@ -271,13 +272,15 @@ public class SmallBankClient {
                 break;
             }
 
-            long waitTime = nextTransactionTime - now;
-            if (waitTime > 0) {
-                try {
-                    Thread.sleep(waitTime / 1_000_000, (int) (waitTime % 1_000_000));
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
+            if (!saturate) {
+                long waitTime = nextTransactionTime - now;
+                if (waitTime > 0) {
+                    try {
+                        Thread.sleep(waitTime / 1_000_000, (int) (waitTime % 1_000_000));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
                 }
             }
 
@@ -297,10 +300,12 @@ public class SmallBankClient {
             }
 
             txCount++;
-            nextTransactionTime += intervalNs;
-            // catch-up if we fall behind to avoid burst
-            while (nextTransactionTime < System.nanoTime()) {
+            if (!saturate) {
                 nextTransactionTime += intervalNs;
+                // catch-up if we fall behind to avoid burst
+                while (nextTransactionTime < System.nanoTime()) {
+                    nextTransactionTime += intervalNs;
+                }
             }
 
             if (txCount % 1000 == 0 && terminalId == 0) {
@@ -557,6 +562,9 @@ public class SmallBankClient {
             phase.terminals = work.getInt("terminals", -1);
             phase.duration = work.getInt("time");
             phase.rate = work.getDouble("rate");
+            if (phase.rate < 0.0) {
+                throw new ConfigurationException("Bad rate for phase " + i + ": rate must be >= 0");
+            }
 
             String weightsStr = work.getString("weights", "15,15,15,25,15,15");
             String[] weightParts = weightsStr.split(",");
@@ -581,7 +589,11 @@ public class SmallBankClient {
         for (int i = 0; i < config.phases.length; i++) {
             System.out.printf("Phase %d:%n", i + 1);
             System.out.printf("Duration: %d seconds%n", config.phases[i].duration);
-            System.out.printf("Rate: %.2f TPS/terminal%n", config.phases[i].rate);
+            if (config.phases[i].rate == 0.0) {
+                System.out.println("Rate: SATURATE (rate=0)");
+            } else {
+                System.out.printf("Rate: %.2f TPS/terminal%n", config.phases[i].rate);
+            }
             System.out.println("Weights: " + Arrays.toString(config.phases[i].weights));
         }
 

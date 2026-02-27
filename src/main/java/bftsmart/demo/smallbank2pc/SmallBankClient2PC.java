@@ -274,7 +274,11 @@ public class SmallBankClient2PC {
                         config.terminals : config.phases[phaseNum].terminals;
 
         System.out.printf("Starting %d terminals for %d seconds%n", terminals, config.phases[phaseNum].duration);
-        System.out.printf("Target rate: %.2f TPS per terminal%n", config.phases[phaseNum].rate);
+        if (config.phases[phaseNum].rate == 0.0) {
+            System.out.println("Target rate: SATURATE (rate=0)");
+        } else {
+            System.out.printf("Target rate: %.2f TPS per terminal%n", config.phases[phaseNum].rate);
+        }
         System.out.println("Transaction weights: " + Arrays.toString(config.phases[phaseNum].weights));
         System.out.println("Number of shards: " + numShards);
 
@@ -313,19 +317,22 @@ public class SmallBankClient2PC {
         long startTime = System.nanoTime();
         long endTime = startTime + TimeUnit.SECONDS.toNanos(config.phases[phaseNum].duration);
 
-        long intervalNs = (long) (1_000_000_000.0 / config.phases[phaseNum].rate);
+        boolean saturate = config.phases[phaseNum].rate == 0.0;
+        long intervalNs = saturate ? 0L : Math.max(1L, (long) (1_000_000_000.0 / config.phases[phaseNum].rate));
         long nextTransactionTime = startTime;
 
         int txCount = 0;
 
         while (System.nanoTime() < endTime) {
             long now = System.nanoTime();
-            long waitTime = nextTransactionTime - now;
-            if (waitTime > 0) {
-                try {
-                    Thread.sleep(waitTime / 1_000_000, (int) (waitTime % 1_000_000));
-                } catch (InterruptedException e) {
-                    break;
+            if (!saturate) {
+                long waitTime = nextTransactionTime - now;
+                if (waitTime > 0) {
+                    try {
+                        Thread.sleep(waitTime / 1_000_000, (int) (waitTime % 1_000_000));
+                    } catch (InterruptedException e) {
+                        break;
+                    }
                 }
             }
 
@@ -346,7 +353,12 @@ public class SmallBankClient2PC {
             }
 
             txCount++;
-            nextTransactionTime += intervalNs;
+            if (!saturate) {
+                nextTransactionTime += intervalNs;
+                while (nextTransactionTime < System.nanoTime()) {
+                    nextTransactionTime += intervalNs;
+                }
+            }
 
             if (txCount % 100 == 0 && terminalId == 0) {
                 LOG.debug("Terminal {} executed {} transactions", terminalId, txCount);
@@ -530,6 +542,9 @@ public class SmallBankClient2PC {
             phase.terminals = work.getInt("terminals", -1);
             phase.duration = work.getInt("time");
             phase.rate = work.getDouble("rate");
+            if (phase.rate < 0.0) {
+                throw new ConfigurationException("Bad rate for phase " + i + ": rate must be >= 0");
+            }
 
             String weightsStr = work.getString("weights", "15,15,15,25,15,15");
             String[] weightParts = weightsStr.split(",");
@@ -551,9 +566,15 @@ public class SmallBankClient2PC {
         System.out.printf("Accounts: %d%n", config.numAccounts);
         System.out.printf("Terminals: %d%n", config.terminals);
         for (int i = 0; i < config.phases.length; i++) {
-            System.out.printf("Phase %d: duration=%ds, rate=%.2f TPS, weights=%s%n",
-                    i + 1, config.phases[i].duration, config.phases[i].rate,
-                    Arrays.toString(config.phases[i].weights));
+            if (config.phases[i].rate == 0.0) {
+                System.out.printf("Phase %d: duration=%ds, rate=SATURATE (rate=0), weights=%s%n",
+                        i + 1, config.phases[i].duration,
+                        Arrays.toString(config.phases[i].weights));
+            } else {
+                System.out.printf("Phase %d: duration=%ds, rate=%.2f TPS, weights=%s%n",
+                        i + 1, config.phases[i].duration, config.phases[i].rate,
+                        Arrays.toString(config.phases[i].weights));
+            }
         }
 
         return config;
