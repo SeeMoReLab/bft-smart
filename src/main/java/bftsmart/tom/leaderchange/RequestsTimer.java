@@ -39,6 +39,7 @@ import org.slf4j.LoggerFactory;
  *
  */
 public class RequestsTimer {
+    private static final long MAX_EFFECTIVE_TIMEOUT_MS = 10_000L;
 
     private enum BackoffIncrementMode {
         LINEAR,
@@ -111,6 +112,7 @@ public class RequestsTimer {
     public void setShortTimeout(long shortTimeout) {
         synchronized (backoffLock) {
             this.shortTimeout = shortTimeout;
+            backoffMultiplier = clampMultiplierToCapLocked(backoffMultiplier);
         }
     }
 
@@ -120,11 +122,12 @@ public class RequestsTimer {
             this.shortTimeout = shortTimeout;
 
             if (shortTimeout <= 0) {
+                backoffMultiplier = clampMultiplierToCapLocked(backoffMultiplier);
                 return;
             }
 
             long adjustedMultiplier = Math.round((double) previousEffectiveTimeout / (double) shortTimeout);
-            backoffMultiplier = Math.max(1, adjustedMultiplier);
+            backoffMultiplier = clampMultiplierToCapLocked(adjustedMultiplier);
         }
     }
 
@@ -135,7 +138,8 @@ public class RequestsTimer {
     }
 
     private long getTimeoutLocked() {
-        long base = (shortTimeout > -1 ? shortTimeout : timeout);
+        long base = getBaseTimeoutLocked();
+        backoffMultiplier = clampMultiplierToCapLocked(backoffMultiplier);
         if (backoffMultiplier <= 1) {
             return base;
         }
@@ -332,7 +336,13 @@ public class RequestsTimer {
                     incrementBackoffMultiplierLocked();
                 }
             } else {
-                incrementBackoffMultiplierLocked();
+                // First timeout after successful progress keeps the current multiplier.
+                // Only consecutive view-change attempts without progress increase it.
+                if (resetBackoffOnNextViewChange) {
+                    resetBackoffOnNextViewChange = false;
+                } else {
+                    incrementBackoffMultiplierLocked();
+                }
             }
 
             effectiveTimeout = getTimeoutLocked();
@@ -369,6 +379,10 @@ public class RequestsTimer {
             if (!timeoutBackoffEnabled || !isSuccessBasedDecayEnabled()) {
                 return;
             }
+
+            // Any successful sequence marks recovery/progress; next view-change attempt
+            // should start with current multiplier (no immediate increment).
+            resetBackoffOnNextViewChange = true;
 
             successfulSequencesSinceDecay = safeAdd(successfulSequencesSinceDecay, 1);
             if (successfulSequencesSinceDecay < decayAfterSuccessfulSequences) {
@@ -420,7 +434,7 @@ public class RequestsTimer {
         } else {
             updatedMultiplier = (backoffMultiplier > Long.MAX_VALUE / 2) ? Long.MAX_VALUE : backoffMultiplier * 2;
         }
-        backoffMultiplier = Math.max(1, updatedMultiplier);
+        backoffMultiplier = clampMultiplierToCapLocked(updatedMultiplier);
     }
 
     private void applyDecayStepsLocked(long steps) {
@@ -445,6 +459,23 @@ public class RequestsTimer {
             return Long.MAX_VALUE;
         }
         return left + right;
+    }
+
+    private long getBaseTimeoutLocked() {
+        return (shortTimeout > -1 ? shortTimeout : timeout);
+    }
+
+    private long maxMultiplierForBaseLocked() {
+        long base = getBaseTimeoutLocked();
+        if (base <= 0) {
+            return Long.MAX_VALUE;
+        }
+        long capped = MAX_EFFECTIVE_TIMEOUT_MS / base;
+        return Math.max(1L, capped);
+    }
+
+    private long clampMultiplierToCapLocked(long multiplier) {
+        return Math.max(1L, Math.min(multiplier, maxMultiplierForBaseLocked()));
     }
 
     private BackoffIncrementMode parseBackoffIncrementMode(String mode) {

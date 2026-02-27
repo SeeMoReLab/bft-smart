@@ -532,7 +532,6 @@ public class Synchronizer {
             lcManager.clearRequestsFromSTOP();
 
             requestsTimer.Enabled(true);
-            requestsTimer.setShortTimeout(-1);
             requestsTimer.startTimer();
 
             //int leader = regency % this.reconfManager.getCurrentViewN(); // new leader
