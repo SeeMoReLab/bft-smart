@@ -602,7 +602,7 @@ public class SmallBankServer extends DefaultRecoverable {
             }
             if (consensusId == selectedWindow.applyTick && pollerDecision != null) {
                 currentTimeoutMs = pollerDecision.timeoutMs;
-                replica.getRequestsTimer().setShortTimeout(currentTimeoutMs);
+                replica.getRequestsTimer().setShortTimeoutPreservingEffectiveTimeout(currentTimeoutMs);
             }
             applyHandledForEpisode = true;
             lastTimeoutUsedMs = currentTimeoutMs;

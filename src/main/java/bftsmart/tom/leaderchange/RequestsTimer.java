@@ -114,6 +114,20 @@ public class RequestsTimer {
         }
     }
 
+    public void setShortTimeoutPreservingEffectiveTimeout(long shortTimeout) {
+        synchronized (backoffLock) {
+            long previousEffectiveTimeout = getTimeoutLocked();
+            this.shortTimeout = shortTimeout;
+
+            if (shortTimeout <= 0) {
+                return;
+            }
+
+            long adjustedMultiplier = Math.round((double) previousEffectiveTimeout / (double) shortTimeout);
+            backoffMultiplier = Math.max(1, adjustedMultiplier);
+        }
+    }
+
     public long getTimeout() {
         synchronized (backoffLock) {
             return getTimeoutLocked();
