@@ -169,6 +169,9 @@ public class SmallBankMessage implements Serializable {
 
     // Deserialize from bytes
     public static SmallBankMessage getObject(byte[] bytes) {
+        if (bytes == null || bytes.length == 0) {
+            return null;
+        }
         try {
             ByteArrayInputStream bais = new ByteArrayInputStream(bytes);
             ObjectInputStream ois = new ObjectInputStream(bais);
