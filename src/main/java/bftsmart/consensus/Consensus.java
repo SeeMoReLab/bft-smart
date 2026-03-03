@@ -155,14 +155,26 @@ public class Consensus {
     public int getEts() {
         return ets;
     }
-    
-    /**
-     * Store the value read from a Byzantine quorum of WRITES
-     * @param value
-     */
-    public void setQuorumWrites(byte[] value) {
 
-        quorumWrites = new TimestampValuePair(ets, value);
+    /**
+     * Store the value read from a Byzantine quorum of WRITES with an explicit
+     * timestamp.
+     *
+     * The timestamp for quorumWrites must be monotonic. Delayed messages from an
+     * older epoch must not overwrite a newer quorumWrites entry.
+     *
+     * @param timestamp timestamp associated with the value
+     * @param value value read from a quorum of WRITES
+     * @return true if quorumWrites was updated, false otherwise
+     */
+    public boolean setQuorumWrites(int timestamp, byte[] value) {
+
+        if (quorumWrites != null && timestamp < quorumWrites.getTimestamp()) {
+            return false;
+        }
+
+        quorumWrites = new TimestampValuePair(timestamp, value);
+        return true;
     }
 
     /**
