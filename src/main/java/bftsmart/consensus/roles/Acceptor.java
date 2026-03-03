@@ -265,7 +265,7 @@ public final class Acceptor {
 					epoch.getConsensus().getDecision().firstMessageProposed.acceptSentTime = System.nanoTime();
 
 					/**** LEADER CHANGE CODE! ******/
-					logger.debug("[CFT Mode] Setting consensus " + cid + " QuorumWrite tiemstamp to "
+					logger.debug("[CFT Mode] Setting consensus " + cid + " QuorumWrite timestamp to "
 							+ epoch.getTimestamp() + " and value " + Arrays.toString(epoch.propValueHash));
 					epoch.getConsensus().setQuorumWrites(epoch.getTimestamp(), epoch.propValueHash);
 					/*****************************************/
@@ -322,7 +322,7 @@ public final class Acceptor {
 				logger.debug("Sending ACCEPT message, cId:{}, I am:{}", cid, me);
 
 				/**** LEADER CHANGE CODE! ******/
-				logger.debug("Setting consensus " + cid + " QuorumWrite tiemstamp to " + epoch.getTimestamp()
+				logger.debug("Setting consensus " + cid + " QuorumWrite timestamp to " + epoch.getTimestamp()
 						+ " and value " + Arrays.toString(value));
 				epoch.getConsensus().setQuorumWrites(epoch.getTimestamp(), value);
 				/*****************************************/
