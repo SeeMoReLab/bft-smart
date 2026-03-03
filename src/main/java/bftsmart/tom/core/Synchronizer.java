@@ -1181,8 +1181,8 @@ public class Synchronizer {
                 e.setAccept(me, hash);
 
                 /********* LEADER CHANGE CODE ********/
-                logger.debug("[CFT Mode] Setting consensus " + currentCID + " QuorumWrite tiemstamp to " + e.getConsensus().getEts() + " and value " + Arrays.toString(hash));
- 	        e.getConsensus().setQuorumWrites(hash);
+                logger.debug("[CFT Mode] Setting consensus " + currentCID + " QuorumWrite timestamp to " + e.getTimestamp() + " and value " + Arrays.toString(hash));
+                e.getConsensus().setQuorumWrites(e.getTimestamp(), hash);
                 /*************************************/
 
             }

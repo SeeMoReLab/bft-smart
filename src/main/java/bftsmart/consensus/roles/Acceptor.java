@@ -255,8 +255,8 @@ public final class Acceptor {
 
 					/**** LEADER CHANGE CODE! ******/
 					logger.debug("[CFT Mode] Setting consensus " + cid + " QuorumWrite tiemstamp to "
-							+ epoch.getConsensus().getEts() + " and value " + Arrays.toString(epoch.propValueHash));
-					epoch.getConsensus().setQuorumWrites(epoch.propValueHash);
+							+ epoch.getTimestamp() + " and value " + Arrays.toString(epoch.propValueHash));
+					epoch.getConsensus().setQuorumWrites(epoch.getTimestamp(), epoch.propValueHash);
 					/*****************************************/
 
 					communication.send(this.controller.getCurrentViewOtherAcceptors(),
@@ -311,9 +311,9 @@ public final class Acceptor {
 				logger.debug("Sending ACCEPT message, cId:{}, I am:{}", cid, me);
 
 				/**** LEADER CHANGE CODE! ******/
-				logger.debug("Setting consensus " + cid + " QuorumWrite tiemstamp to " + epoch.getConsensus().getEts()
+				logger.debug("Setting consensus " + cid + " QuorumWrite tiemstamp to " + epoch.getTimestamp()
 						+ " and value " + Arrays.toString(value));
-				epoch.getConsensus().setQuorumWrites(value);
+				epoch.getConsensus().setQuorumWrites(epoch.getTimestamp(), value);
 				/*****************************************/
 
 				if (epoch.getConsensus().getDecision().firstMessageProposed != null) {
