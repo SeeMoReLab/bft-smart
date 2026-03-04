@@ -340,7 +340,7 @@ public class ClientsManager {
                 clientData.getLastMessageDelivered() >= request.getSequence()) {
             
             clientData.clientLock.unlock();
-            logger.warn("Detected a leader replay attack, rejecting request");
+            logger.debug("Possible replay or duplicate forwarded request");
             return false;
         }
 
