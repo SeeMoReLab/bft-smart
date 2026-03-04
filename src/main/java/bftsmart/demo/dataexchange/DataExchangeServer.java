@@ -30,6 +30,7 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
     private static final int EPISODE_CLIENT_ID_BASE = 10000;
 
     private final ServiceReplica replica;
+    private final int replicaId;
     private final Server grpcServer;
     private final AtomicInteger sequence = new AtomicInteger(0);
     private final int senderId;
@@ -47,6 +48,7 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
     }
 
     public DataExchangeServer(int replicaId, String configHome) throws IOException {
+        this.replicaId = replicaId;
         if (configHome == null) {
             this.replica = new ServiceReplica(replicaId, this, this);
         } else {
@@ -84,7 +86,7 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
         }
 
         this.grpcServer = ServerBuilder.forPort(dataExchangePort)
-                .addService(new ConsensusService(replica, senderId, sequence))
+                .addService(new ConsensusService(replica, this.replicaId, senderId, sequence))
                 .build()
                 .start();
 
@@ -169,11 +171,13 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
 
     private static final class ConsensusService extends ConsensusGrpc.ConsensusImplBase {
         private final ServiceReplica replica;
+        private final int replicaId;
         private final int senderId;
         private final AtomicInteger sequence;
 
-        private ConsensusService(ServiceReplica replica, int senderId, AtomicInteger sequence) {
+        private ConsensusService(ServiceReplica replica, int replicaId, int senderId, AtomicInteger sequence) {
             this.replica = replica;
+            this.replicaId = replicaId;
             this.senderId = senderId;
             this.sequence = sequence;
         }
@@ -181,8 +185,26 @@ public class DataExchangeServer extends DefaultSingleRecoverable {
         @Override
         public void submitReportBatch(ReportBatch request, StreamObserver<Empty> responseObserver) {
             try {
+                int episode = request.getEpisode();
+                int[] viewProcesses = replica.getReplicaContext().getSVController().getCurrentViewProcesses();
+                if (viewProcesses != null && viewProcesses.length > 0) {
+                    int owner = viewProcesses[Math.floorMod(episode, viewProcesses.length)];
+                    if (owner != replicaId) {
+                        logger.info(
+                                "Received gRPC ReportBatch episode {} with {} reports, but local replica {} is not owner (owner={} viewN={}). Acknowledging without PBFT submit.",
+                                episode, request.getReportsCount(), replicaId, owner, viewProcesses.length);
+                        responseObserver.onNext(Empty.getDefaultInstance());
+                        responseObserver.onCompleted();
+                        return;
+                    }
+                } else {
+                    logger.warn(
+                            "Received gRPC ReportBatch episode {} with {} reports, but current view has no processes. Forwarding to PBFT as fallback.",
+                            episode, request.getReportsCount());
+                }
+
                 logger.info("Received gRPC ReportBatch episode {} with {} reports: {}",
-                        request.getEpisode(), request.getReportsCount(), request);
+                        episode, request.getReportsCount(), request);
                 TOMMessage message = buildMessage(request);
                 replica.submitClientRequest(message);
                 responseObserver.onNext(Empty.getDefaultInstance());
