@@ -931,6 +931,15 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         selectedWindow = new EpisodeWindow(decision.startTick, decision.reportSeq, decision.reportLength);
         waitingForRecommendation = false;
         stopTimeoutPolling();
+        logger.info(
+                "[learning] received recommendation: episode={} report_seq={} apply_tick={} reward_tick={} timeout_ms={} current_cid={}",
+                currentEpisode,
+                selectedWindow.reportSeq,
+                selectedWindow.applyTick,
+                selectedWindow.rewardTick,
+                decision.timeoutMs,
+                consensusId
+        );
         if (consensusId > selectedWindow.applyTick) {
             applyHandledForEpisode = true;
             lastTimeoutUsedMs = currentTimeoutMs;
@@ -952,12 +961,33 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             if (consensusId < selectedWindow.applyTick) {
                 return;
             }
+            boolean appliedRecommendation = false;
             if (consensusId == selectedWindow.applyTick && pollerDecision != null) {
                 currentTimeoutMs = pollerDecision.timeoutMs;
                 replica.getRequestsTimer().setShortTimeoutPreservingEffectiveTimeout(currentTimeoutMs);
+                appliedRecommendation = true;
             }
             applyHandledForEpisode = true;
             lastTimeoutUsedMs = currentTimeoutMs;
+            if (appliedRecommendation) {
+                logger.info(
+                        "[learning] applied recommendation on time: episode={} report_seq={} apply_tick={} current_cid={} timeout_ms={}",
+                        currentEpisode,
+                        selectedWindow.reportSeq,
+                        selectedWindow.applyTick,
+                        consensusId,
+                        currentTimeoutMs
+                );
+            } else {
+                logger.info(
+                        "[learning] apply deadline reached without recommendation update: episode={} report_seq={} apply_tick={} current_cid={} timeout_ms={}",
+                        currentEpisode,
+                        selectedWindow.reportSeq,
+                        selectedWindow.applyTick,
+                        consensusId,
+                        currentTimeoutMs
+                );
+            }
             return;
         }
         if (reachedReportCapForEpisode && capApplyDeadlineTick >= 0 && consensusId >= capApplyDeadlineTick) {
@@ -965,6 +995,13 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             applyHandledForEpisode = true;
             lastTimeoutUsedMs = currentTimeoutMs;
             stopTimeoutPolling();
+            logger.info(
+                    "[learning] recommendation unavailable at cap apply deadline: episode={} cap_apply_tick={} current_cid={} timeout_ms={}",
+                    currentEpisode,
+                    capApplyDeadlineTick,
+                    consensusId,
+                    currentTimeoutMs
+            );
         }
     }
 
@@ -973,10 +1010,13 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             return;
         }
         int rewardDeadline = -1;
+        String rewardSource = "none";
         if (selectedWindow != null) {
             rewardDeadline = selectedWindow.rewardTick;
+            rewardSource = "recommended_window";
         } else if (reachedReportCapForEpisode && capRewardDeadlineTick >= 0) {
             rewardDeadline = capRewardDeadlineTick;
+            rewardSource = "cap_window";
         }
         if (rewardDeadline < 0 || consensusId < rewardDeadline) {
             return;
@@ -984,6 +1024,14 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         captureReward(currentEpisode);
         rewardCapturedForEpisode = true;
         stopTimeoutPolling();
+        logger.info(
+                "[learning] captured reward: episode={} reward_tick={} current_cid={} source={} timeout_ms={}",
+                currentEpisode,
+                rewardDeadline,
+                consensusId,
+                rewardSource,
+                lastTimeoutUsedMs
+        );
         startNextEpisode(consensusId);
     }
 
@@ -1104,6 +1152,14 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                     if (reportSeq > startTick && reportLength > 0
                             && !pollerStopRequested && pollerEpisode == episode) {
                         pollerDecision = new TimeoutDecision(timeoutMs, startTick, reportSeq, reportLength);
+                        logger.info(
+                                "[learning] timeout READY: episode={} start_tick={} report_seq={} report_length={} timeout_ms={}",
+                                episode,
+                                startTick,
+                                reportSeq,
+                                reportLength,
+                                timeoutMs
+                        );
                         return;
                     }
                 }

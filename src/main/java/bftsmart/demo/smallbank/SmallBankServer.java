@@ -581,6 +581,13 @@ public class SmallBankServer extends DefaultRecoverable {
         selectedWindow = new EpisodeWindow(decision.startTick, decision.reportSeq, decision.reportLength);
         waitingForRecommendation = false;
         stopTimeoutPolling();
+        System.out.println(
+                "[learning] received recommendation: episode=" + currentEpisode
+                        + " report_seq=" + selectedWindow.reportSeq
+                        + " apply_tick=" + selectedWindow.applyTick
+                        + " reward_tick=" + selectedWindow.rewardTick
+                        + " timeout_ms=" + decision.timeoutMs
+                        + " current_cid=" + consensusId);
         if (consensusId > selectedWindow.applyTick) {
             applyHandledForEpisode = true;
             lastTimeoutUsedMs = currentTimeoutMs;
@@ -600,12 +607,29 @@ public class SmallBankServer extends DefaultRecoverable {
             if (consensusId < selectedWindow.applyTick) {
                 return;
             }
+            boolean appliedRecommendation = false;
             if (consensusId == selectedWindow.applyTick && pollerDecision != null) {
                 currentTimeoutMs = pollerDecision.timeoutMs;
                 replica.getRequestsTimer().setShortTimeoutPreservingEffectiveTimeout(currentTimeoutMs);
+                appliedRecommendation = true;
             }
             applyHandledForEpisode = true;
             lastTimeoutUsedMs = currentTimeoutMs;
+            if (appliedRecommendation) {
+                System.out.println(
+                        "[learning] applied recommendation on time: episode=" + currentEpisode
+                                + " report_seq=" + selectedWindow.reportSeq
+                                + " apply_tick=" + selectedWindow.applyTick
+                                + " current_cid=" + consensusId
+                                + " timeout_ms=" + currentTimeoutMs);
+            } else {
+                System.out.println(
+                        "[learning] apply deadline reached without recommendation update: episode=" + currentEpisode
+                                + " report_seq=" + selectedWindow.reportSeq
+                                + " apply_tick=" + selectedWindow.applyTick
+                                + " current_cid=" + consensusId
+                                + " timeout_ms=" + currentTimeoutMs);
+            }
             return;
         }
         if (reachedReportCapForEpisode && capApplyDeadlineTick >= 0 && consensusId >= capApplyDeadlineTick) {
@@ -613,6 +637,11 @@ public class SmallBankServer extends DefaultRecoverable {
             applyHandledForEpisode = true;
             lastTimeoutUsedMs = currentTimeoutMs;
             stopTimeoutPolling();
+            System.out.println(
+                    "[learning] recommendation unavailable at cap apply deadline: episode=" + currentEpisode
+                            + " cap_apply_tick=" + capApplyDeadlineTick
+                            + " current_cid=" + consensusId
+                            + " timeout_ms=" + currentTimeoutMs);
         }
     }
 
@@ -621,10 +650,13 @@ public class SmallBankServer extends DefaultRecoverable {
             return;
         }
         int rewardDeadline = -1;
+        String rewardSource = "none";
         if (selectedWindow != null) {
             rewardDeadline = selectedWindow.rewardTick;
+            rewardSource = "recommended_window";
         } else if (reachedReportCapForEpisode && capRewardDeadlineTick >= 0) {
             rewardDeadline = capRewardDeadlineTick;
+            rewardSource = "cap_window";
         }
         if (rewardDeadline < 0 || consensusId < rewardDeadline) {
             return;
@@ -632,6 +664,12 @@ public class SmallBankServer extends DefaultRecoverable {
         captureReward(currentEpisode);
         rewardCapturedForEpisode = true;
         stopTimeoutPolling();
+        System.out.println(
+                "[learning] captured reward: episode=" + currentEpisode
+                        + " reward_tick=" + rewardDeadline
+                        + " current_cid=" + consensusId
+                        + " source=" + rewardSource
+                        + " timeout_ms=" + lastTimeoutUsedMs);
         startNextEpisode(consensusId);
     }
 
@@ -764,6 +802,12 @@ public class SmallBankServer extends DefaultRecoverable {
                     if (reportSeq > startTick && reportLength > 0
                             && !pollerStopRequested && pollerEpisode == episode) {
                         pollerDecision = new TimeoutDecision(timeoutMs, startTick, reportSeq, reportLength);
+                        System.out.println(
+                                "[learning] timeout READY: episode=" + episode
+                                        + " start_tick=" + startTick
+                                        + " report_seq=" + reportSeq
+                                        + " report_length=" + reportLength
+                                        + " timeout_ms=" + timeoutMs);
                         return;
                     }
                 }
