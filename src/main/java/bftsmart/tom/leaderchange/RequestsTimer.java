@@ -83,6 +83,7 @@ public class RequestsTimer {
     private ServerViewController controller; // Reconfiguration manager
     
     private HashMap <Integer, Timer> stopTimers = new HashMap<>();
+    private int highestStopRegencySeen = -1;
     
     //private Storage st1 = new Storage(100000);
     //private Storage st2 = new Storage(10000);
@@ -247,7 +248,7 @@ public class RequestsTimer {
                 TOMMessage request = li.next();
                 if (!request.timeout) {
                     
-                    logger.info("Forwarding requests {} to leader", request);
+                    // logger.info("Forwarding requests {} to leader", request);
 
                     request.signed = request.serializedMessageSignature != null;
                     tomLayer.forwardRequestToLeader(request);
@@ -278,36 +279,77 @@ public class RequestsTimer {
     }
     
     public void setSTOP(int regency, LCMessage stop) {
-        
-        stopSTOP(regency);
-        
-        SendStopTask stopTask = new SendStopTask(stop);
-        Timer stopTimer = new Timer("Stop message");
-        
-        stopTimer.schedule(stopTask, getTimeout());
-        
-       stopTimers.put(regency, stopTimer);
+        synchronized (stopTimers) {
+            if (regency < highestStopRegencySeen) {
+                return;
+            }
+
+            if (regency > highestStopRegencySeen) {
+                highestStopRegencySeen = regency;
+                stopSTOPsBeforeLocked(regency);
+            }
+
+            stopSTOPLocked(regency);
+
+            SendStopTask stopTask = new SendStopTask(stop);
+            Timer stopTimer = new Timer("Stop message");
+
+            stopTimer.schedule(stopTask, getTimeout());
+
+            stopTimers.put(regency, stopTimer);
+        }
 
     }   
     
     public void stopAllSTOPs() {
-        Iterator stops = getTimers().iterator();
-        while (stops.hasNext()) {
-            stopSTOP((Integer) stops.next());
+        synchronized (stopTimers) {
+            Iterator stops = ((HashMap<Integer, Timer>) stopTimers.clone()).keySet().iterator();
+            while (stops.hasNext()) {
+                stopSTOPLocked((Integer) stops.next());
+            }
+            highestStopRegencySeen = -1;
         }
     }
     
     public void stopSTOP(int regency){
-        
-        Timer stopTimer = stopTimers.remove(regency);
-        if (stopTimer != null) stopTimer.cancel();
+        synchronized (stopTimers) {
+            stopSTOPLocked(regency);
+        }
 
     }
     
     public Set<Integer> getTimers() {
+        synchronized (stopTimers) {
+            return ((HashMap<Integer, Timer>) stopTimers.clone()).keySet();
+        }
         
-        return ((HashMap <Integer,Timer>) stopTimers.clone()).keySet();
-        
+    }
+
+    private void stopSTOPLocked(int regency) {
+        Timer stopTimer = stopTimers.remove(regency);
+        if (stopTimer != null) {
+            stopTimer.cancel();
+        }
+    }
+
+    private void stopSTOPsBeforeLocked(int regency) {
+        Iterator<Integer> timers = ((HashMap<Integer, Timer>) stopTimers.clone()).keySet().iterator();
+        while (timers.hasNext()) {
+            int existingRegency = timers.next();
+            if (existingRegency < regency) {
+                stopSTOPLocked(existingRegency);
+            }
+        }
+    }
+
+    private boolean shouldRetransmitStop(int regency) {
+        synchronized (stopTimers) {
+            if (regency < highestStopRegencySeen) {
+                stopSTOPLocked(regency);
+                return false;
+            }
+            return true;
+        }
     }
     
     public void shutdown() {
@@ -533,6 +575,9 @@ public class RequestsTimer {
          * message to the other replicas
          */
         public void run() {
+                if (!shouldRetransmitStop(stop.getReg())) {
+                    return;
+                }
 
                 logger.info("Re-transmitting STOP message to install regency " + stop.getReg());
                 communication.send(controller.getCurrentViewOtherAcceptors(),this.stop);
