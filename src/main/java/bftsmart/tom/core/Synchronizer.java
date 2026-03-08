@@ -131,7 +131,6 @@ public class Synchronizer {
             lcManager.setNextReg(lcManager.getLastReg() + 1); // define next timestamp
 
             regency = lcManager.getNextReg(); // update variable 
-            removeSTOPretransmissions(regency - 1); // node moved to a higher regency; stop older STOP retransmissions
 
             // store messages to be ordered
             lcManager.setCurrentRequestTimedOut(requestList);
@@ -463,7 +462,6 @@ public class Synchronizer {
             lcManager.setNextReg(lcManager.getLastReg() + 1); // define next timestamp
 
             int regency = lcManager.getNextReg();
-            removeSTOPretransmissions(regency - 1); // node moved to a higher regency; stop older STOP retransmissions
 
             // store information about message I am going to send
             lcManager.addStop(regency, this.controller.getStaticConf().getProcessId());
