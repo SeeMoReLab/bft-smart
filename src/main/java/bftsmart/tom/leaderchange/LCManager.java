@@ -796,33 +796,46 @@ public class LCManager {
     public CertifiedDecision getHighestLastCID(int ts) {
 
         CertifiedDecision highest = new CertifiedDecision(-2, -2, null, null);
+        boolean isBFT = tomLayer.controller.getStaticConf().isBFT();
 
         HashSet<CertifiedDecision> lasts = lastCIDs.get(ts);
 
         if (lasts == null) return null;
        
         for (CertifiedDecision l : lasts) {
+            if (l == null) continue;
 
-            //TODO: CHECK OF THE PROOF IS MISSING!!!!
-            if (tomLayer.controller.getStaticConf().isBFT() && hasValidProof(l) && l.getCID() > highest.getCID()) 
+            if (isBFT) {
+                if (hasValidProof(l) && l.getCID() > highest.getCID()) {
                     highest = l;
-            else if(l.getCID() > highest.getCID()){
-                    highest = l;
-             }
+                }
+            } else if (l.getCID() > highest.getCID()) {
+                highest = l;
+            }
         }
 
-        return highest;
+        return highest.getCID() == -2 ? null : highest;
     }
     
     // verifies is a proof associated with a decided value is valid
     public boolean hasValidProof(CertifiedDecision cDec) {
+        if (cDec == null) {
+            logger.warn("Null CertifiedDecision while validating proof");
+            return false;
+        }
         
         if (cDec.getCID() == -1) return true; // If the last CID is -1 it means the replica
                                              // did not complete any consensus and cannot have
                                              // any proof
-        
-        byte[] hashedValue = md.digest(cDec.getDecision());
-        Set<ConsensusMessage> ConsensusMessages = cDec.getConsMessages();
+
+        byte[] decision = cDec.getDecision();
+        Set<ConsensusMessage> consensusMessages = cDec.getConsMessages();
+        if (decision == null || consensusMessages == null || consensusMessages.isEmpty()) {
+            logger.warn("Invalid proof payload for CID {} (decision or proof is null/empty)", cDec.getCID());
+            return false;
+        }
+
+        byte[] hashedValue = md.digest(decision);
         int certificateCurrentView = (2*tomLayer.controller.getCurrentViewF()) + 1;
         int certificateLastView = -1;
         if (tomLayer.controller.getLastView() != null) certificateLastView = (2*tomLayer.controller.getLastView().getF()) + 1;
@@ -831,7 +844,8 @@ public class LCManager {
         
         HashSet<Integer> alreadyCounted = new HashSet<>(); //stores replica IDs that were already counted
             
-        for (ConsensusMessage consMsg : ConsensusMessages) {
+        for (ConsensusMessage consMsg : consensusMessages) {
+            if (consMsg == null) continue;
             
             ConsensusMessage cm = new ConsensusMessage(consMsg.getType(),consMsg.getNumber(),
                     consMsg.getEpoch(), consMsg.getSender(), consMsg.getValue());

@@ -711,10 +711,15 @@ public class Synchronizer {
                     // TODO: WILL BE NECESSARY TO ADD A PROOF!!!??
 
                 } else {                    
-                    lastDec = new CertifiedDecision(this.controller.getStaticConf().getProcessId(), last, null, null);
+                    // If we don't have a complete decision/proof for the last CID, advertise -1.
+                    // This avoids sending an invalid proof candidate for a concrete CID.
+                    lastDec = new CertifiedDecision(this.controller.getStaticConf().getProcessId(), -1, null, null);
 
                     ////// THIS IS TO CATCH A BUG!!!!!
                     if (last > -1) {
+                        logger.warn("Missing complete last CID proof at regency {}. "
+                                + "Last executed CID is {}, but leader-change metadata will advertise -1.",
+                                regency, last);
                         logger.debug("[DEBUG INFO FOR LAST CID #2]");
 
                         if (cons == null) {
@@ -725,11 +730,11 @@ public class Synchronizer {
                             logger.debug("No decision epoch for cid " + last);
                         } else {
                             logger.debug("epoch for cid: " + last + ": " + cons.getDecisionEpoch().toString());
-                        }
-                        if (cons.getDecisionEpoch().propValue == null) {
-                            logger.debug("No propose for cid " + last);
-                        } else {
-                            logger.debug("Propose hash for cid " + last + ": " + Base64.encodeBase64String(tom.computeHash(cons.getDecisionEpoch().propValue)));
+                            if (cons.getDecisionEpoch().propValue == null) {
+                                logger.debug("No propose for cid " + last);
+                            } else {
+                                logger.debug("Propose hash for cid " + last + ": " + Base64.encodeBase64String(tom.computeHash(cons.getDecisionEpoch().propValue)));
+                            }
                         }
                     }
                     
@@ -917,6 +922,10 @@ public class Synchronizer {
         ByteArrayOutputStream bos = null;
 
         CertifiedDecision lastHighestCID = lcManager.getHighestLastCID(regency);
+        if (lastHighestCID == null) {
+            logger.warn("Cannot catch up for regency {} because there is no valid last CID proof yet", regency);
+            return;
+        }
 
         int currentCID = lastHighestCID.getCID() + 1;
         HashSet<SignedObject> signedCollects = null;
