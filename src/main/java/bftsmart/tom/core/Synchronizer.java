@@ -446,24 +446,28 @@ public class Synchronizer {
         boolean condition;
         ObjectOutputStream out = null;
         ByteArrayOutputStream bos = null;
-        
-        if (this.controller.getStaticConf().isBFT()) {
-            condition = lcManager.getStopsSize(nextReg) > this.controller.getCurrentViewF();
-        } else {
-            condition = lcManager.getStopsSize(nextReg) > 0;
-        }
-        
-        // Ask to start the synchronizations phase if enough messages have been received already
-        if (condition && lcManager.getNextReg() == lcManager.getLastReg()) {
-            
-            logger.debug("Initialize synch phase");
+
+        int startThreshold = this.controller.getStaticConf().isBFT()
+                ? this.controller.getCurrentViewF() + 1
+                : 1;
+        int minRegency = lcManager.getLastReg() + 1;
+        int highestRegencyWithStartQuorum = lcManager.getHighestRegWithAtLeastStops(minRegency, startThreshold);
+
+        // Ask to start (or jump) in the synchronization phase if enough STOPs were observed for a higher regency
+        if (highestRegencyWithStartQuorum >= minRegency && highestRegencyWithStartQuorum > lcManager.getNextReg()) {
+
+            logger.info("Initialize synch phase: jumping next regency from {} to {}", lcManager.getNextReg(),
+                    highestRegencyWithStartQuorum);
             requestsTimer.Enabled(false);
             requestsTimer.stopTimer();
 
-            lcManager.setNextReg(lcManager.getLastReg() + 1); // define next timestamp
+            lcManager.setNextReg(highestRegencyWithStartQuorum); // define next timestamp
 
-            int regency = lcManager.getNextReg();
+            int regency = lcManager.getNextReg(); // update variable
             removeSTOPretransmissions(regency - 1); // node moved to a higher regency; stop older STOP retransmissions
+
+            // process queued STOP messages for this regency to capture relayed requests
+            processOutOfContextSTOPs(regency);
 
             // store information about message I am going to send
             lcManager.addStop(regency, this.controller.getStaticConf().getProcessId());
@@ -510,26 +514,27 @@ public class Synchronizer {
                 logger.error("Could not deserialize STOP message", ex);
             }
         }
-        
+
+        int currentNextReg = lcManager.getNextReg();
         if (this.controller.getStaticConf().isBFT()) {
-            condition = lcManager.getStopsSize(nextReg) > (2 * this.controller.getCurrentViewF());
+            condition = lcManager.getStopsSize(currentNextReg) > (2 * this.controller.getCurrentViewF());
         } else {
-            condition = lcManager.getStopsSize(nextReg) > this.controller.getCurrentViewF();
+            condition = lcManager.getStopsSize(currentNextReg) > this.controller.getCurrentViewF();
         }
-        
+
         // Did the synchronization phase really started?
         //if (lcManager.getStopsSize(nextReg) > this.reconfManager.getQuorum2F() && lcManager.getNextReg() > lcManager.getLastReg()) {
-        if (condition && lcManager.getNextReg() > lcManager.getLastReg()) {
-            
+        if (condition && currentNextReg > lcManager.getLastReg()) {
+
             if (!execManager.stopped()) execManager.stop(); // stop consensus execution if more than f replicas sent a STOP message
 
-            logger.debug("Installing regency " + lcManager.getNextReg());
-            lcManager.setLastReg(lcManager.getNextReg()); // define last timestamp
+            logger.debug("Installing regency " + currentNextReg);
+            lcManager.setLastReg(currentNextReg); // define last timestamp
 
             int regency = lcManager.getLastReg();
 
             // avoid memory leaks
-            lcManager.removeStops(nextReg);
+            lcManager.removeStops(regency);
             lcManager.clearCurrentRequestTimedOut();
             lcManager.clearRequestsFromSTOP();
 
@@ -842,7 +847,12 @@ public class Synchronizer {
                 } else if (msg.getReg() > lcManager.getLastReg()) { // send STOP to out of context if
                                                                     // it is for a future regency
                     logger.debug("Keeping STOP message as out of context for regency " + msg.getReg());
+                    // Keep STOP evidence for future regencies to allow jumping nextReg after f+1 STOPs.
+                    lcManager.addStop(msg.getReg(), msg.getSender());
                     outOfContextLC.add(msg);
+
+                    // Evaluate whether this STOP allows advancing nextReg to a higher regency.
+                    startSynchronization(msg.getReg());
 
                 } else {
                     logger.debug("Discarding STOP message");

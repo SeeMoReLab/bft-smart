@@ -282,6 +282,30 @@ public class LCManager {
     }
 
     /**
+     * Get the highest regency greater than or equal to {@code minRegency} that has at least
+     * {@code minStops} STOP messages recorded.
+     *
+     * @param minRegency lowest regency to consider
+     * @param minStops minimum number of STOP senders required
+     * @return highest matching regency, or {@code -1} if none exists
+     */
+    public int getHighestRegWithAtLeastStops(int minRegency, int minStops) {
+        int highest = -1;
+
+        for (Integer regency : stops.keySet()) {
+            if (regency < minRegency) continue;
+
+            HashSet<Integer> pids = stops.get(regency);
+            int stopCount = (pids == null ? 0 : pids.size());
+            if (stopCount >= minStops && regency > highest) {
+                highest = regency;
+            }
+        }
+
+        return highest;
+    }
+
+    /**
      * Keep last CID from an incoming SYNC message
      * @param regency the current regency
      * @param lastCID the last CID data
