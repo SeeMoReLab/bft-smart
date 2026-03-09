@@ -16,6 +16,7 @@ limitations under the License.
 package bftsmart.consensus;
 
 import bftsmart.tom.core.messages.TOMMessage;
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
@@ -26,6 +27,9 @@ import org.slf4j.LoggerFactory;
  * @author Alysson Bessani
  */
 public class Decision {
+    private static final Logger logger = LoggerFactory.getLogger(Decision.class);
+    private static final long WAIT_LOG_INTERVAL_MS = 5000L;
+    private static final long WAIT_SLEEP_MS = 50L;
 
     private final int cid; // Consensus ID in which the value was decided
     private Epoch decisionEpoch = null; // Epoch in which the value was decided
@@ -126,14 +130,18 @@ public class Decision {
     }
 
     private void waitForPropose() {
+        long lastLogTime = 0;
         while (decisionEpoch == null ||
                 decisionEpoch.deserializedPropValue == null) {
             try {
-                LoggerFactory.getLogger(this.getClass()).info("waiting for propose for consensus " + cid);
-                Thread.sleep(1);
+                long now = System.currentTimeMillis();
+                if ((now - lastLogTime) >= WAIT_LOG_INTERVAL_MS) {
+                    logger.warn("Still waiting for propose for consensus {}", cid);
+                    lastLogTime = now;
+                }
+                Thread.sleep(WAIT_SLEEP_MS);
             } catch (InterruptedException ie) {
-                
-                LoggerFactory.getLogger(this.getClass()).error("Interruption during sleep",ie);
+                logger.error("Interruption during sleep", ie);
             }
         }
     }

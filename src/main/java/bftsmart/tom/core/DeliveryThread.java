@@ -16,6 +16,7 @@ limitations under the License.
 package bftsmart.tom.core;
 
 import bftsmart.consensus.Decision;
+import bftsmart.consensus.Epoch;
 import bftsmart.reconfiguration.ServerViewController;
 import bftsmart.statemanagement.ApplicationState;
 import bftsmart.tom.MessageContext;
@@ -118,7 +119,12 @@ public final class DeliveryThread extends Thread {
 	}
 
 	private boolean containsReconfig(Decision dec) {
-		TOMMessage[] decidedMessages = dec.getDeserializedValue();
+		Epoch decisionEpoch = dec.getDecisionEpoch();
+		TOMMessage[] decidedMessages = (decisionEpoch != null ? decisionEpoch.deserializedPropValue : null);
+		if (decidedMessages == null) {
+			logger.warn("Consensus {} has no cached deserialized requests while checking reconfiguration", dec.getConsensusId());
+			return false;
+		}
 
 		for (TOMMessage decidedMessage : decidedMessages) {
 			if (decidedMessage.getReqType() == TOMMessageType.RECONFIG
@@ -283,7 +289,9 @@ public final class DeliveryThread extends Thread {
 						cDecs[count] = cDec;
 
 						// cons.firstMessageProposed contains the performance counters
-						if (requests[count][0].equals(d.firstMessageProposed)) {
+						if (requests[count] != null
+								&& requests[count].length > 0
+								&& requests[count][0].equals(d.firstMessageProposed)) {
 							d.firstMessageProposed.timestamp = requests[count][0].timestamp;
 							d.firstMessageProposed.seed = requests[count][0].seed;
 							d.firstMessageProposed.numOfNonces = requests[count][0].numOfNonces;
@@ -341,16 +349,17 @@ public final class DeliveryThread extends Thread {
 	}
 
 	private TOMMessage[] extractMessagesFromDecision(Decision dec) {
-		TOMMessage[] requests = dec.getDeserializedValue();
+		Epoch decisionEpoch = dec.getDecisionEpoch();
+		TOMMessage[] requests = (decisionEpoch != null ? decisionEpoch.deserializedPropValue : null);
 		if (requests == null) {
-			// there are no cached deserialized requests
-			// this may happen if this batch proposal was not verified
-			// TODO: this condition is possible?
-
-			logger.debug("Interpreting and verifying batched requests.");
-
-			// obtain an array of requests from the decisions obtained
-			BatchReader batchReader = new BatchReader(dec.getValue(), controller.getStaticConf().getUseSignatures() == 1);
+			// There are no cached deserialized requests, so decode from the decided value.
+			logger.debug("No cached requests for consensus {}. Interpreting and verifying batched requests.",
+					dec.getConsensusId());
+			byte[] decidedValue = (decisionEpoch != null ? decisionEpoch.propValue : null);
+			if (decidedValue == null) {
+				decidedValue = dec.getValue();
+			}
+			BatchReader batchReader = new BatchReader(decidedValue, controller.getStaticConf().getUseSignatures() == 1);
 			requests = batchReader.deserialiseRequests(controller);
 		} else {
 			logger.debug("Using cached requests from the propose.");

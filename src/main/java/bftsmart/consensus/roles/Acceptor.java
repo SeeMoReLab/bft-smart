@@ -278,12 +278,14 @@ public final class Acceptor {
 				}
 				executionManager.processOutOfContext(epoch.getConsensus());
 
-			} else if (epoch.deserializedPropValue == null 
-					&& !tomLayer.isChangingLeader()) { // force a leader change
-				tomLayer.getSynchronizer().triggerTimeout(new LinkedList<>());
+				} else if (epoch.deserializedPropValue == null) {
+					// If proposal validation failed, force recovery even during LC.
+					logger.warn("Failed to validate proposed value for consensus {}. Triggering leader-change recovery (isChangingLeader={})",
+							cid, tomLayer.isChangingLeader());
+					tomLayer.getSynchronizer().triggerTimeout(new LinkedList<>());
+				}
 			}
 		}
-	}
 
 	/**
 	 * Called when a WRITE message is received
@@ -444,7 +446,8 @@ public final class Acceptor {
 
 		if (epoch.countAccept(value) > controller.getQuorum()
 				&& !epoch.getConsensus().isDecided()
-				&& Arrays.equals(value, epoch.propValueHash)) {
+				&& Arrays.equals(value, epoch.propValueHash)
+				&& epoch.deserializedPropValue != null) {
 			logger.debug("Deciding consensus " + cid);
 			decide(epoch);
 
@@ -452,6 +455,12 @@ public final class Acceptor {
 			if (controller.getStaticConf().useReadOnlyRequests())
 				forwardDecision(epoch);
 			// END DECISION_FORWARDING
+		} else if (epoch.countAccept(value) > controller.getQuorum()
+				&& !epoch.getConsensus().isDecided()
+				&& Arrays.equals(value, epoch.propValueHash)
+				&& epoch.deserializedPropValue == null) {
+			logger.warn("Consensus {} reached ACCEPT quorum without a valid deserialized proposal. Triggering recovery", cid);
+			tomLayer.getSynchronizer().triggerTimeout(new LinkedList<>());
 		}
 	}
 
@@ -590,6 +599,11 @@ public final class Acceptor {
 			logger.debug("Deciding consensus " + cid + " using the forwarded decision!");
 			// If decision is valid, set deserializedPropValue in epoch
 			epoch.deserializedPropValue = tomLayer.checkProposedValue(msg.getValue(), true);
+			if (epoch.deserializedPropValue == null) {
+				logger.warn("Forwarded decision for consensus {} failed proposal validation. Triggering recovery", cid);
+				tomLayer.getSynchronizer().triggerTimeout(new LinkedList<>());
+				return;
+			}
 
 			// Attach decision to epoch
 			Decision decision = epoch.getConsensus().getDecision();
