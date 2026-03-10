@@ -30,6 +30,7 @@ import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.core.messages.ForwardedMessage;
 import bftsmart.tom.core.messages.TOMMessage;
 import bftsmart.tom.core.messages.TOMMessageType;
+import bftsmart.tom.leaderchange.LCMessage;
 import bftsmart.tom.leaderchange.RequestsTimer;
 import bftsmart.tom.server.Recoverable;
 import bftsmart.tom.server.RequestVerifier;
@@ -280,7 +281,8 @@ public final class TOMLayer extends Thread implements RequestReceiver {
             }
             try {
                 logger.info("Triggering periodic leader-change due to failure injection schedule");
-                syncher.triggerTimeout(new LinkedList<TOMMessage>());
+                int[] myself = new int[]{controller.getStaticConf().getProcessId()};
+                communication.send(myself, new LCMessage(-1, TOMUtil.FORCE_LC_LOCALLY, -1, null));
             } catch (Exception exception) {
                 logger.error("Error while triggering periodic leader-change", exception);
             }

@@ -15,6 +15,8 @@ limitations under the License.
 */
 package bftsmart.communication;
 
+import java.util.LinkedList;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -93,6 +95,8 @@ public class MessageHandler {
 					
 					if (lcMsg.TRIGGER_LC_LOCALLY)
 						tomLayer.requestsTimer.run_lc_protocol();
+					else if (lcMsg.FORCE_LC_LOCALLY)
+						tomLayer.getSynchronizer().triggerTimeout(new LinkedList<>());
 					else
 						tomLayer.getSynchronizer().deliverTimeoutRequest(lcMsg);
 					/**************************************************************/

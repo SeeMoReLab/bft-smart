@@ -33,6 +33,8 @@ public class LCMessage extends SystemMessage {
     private byte[] payload;
     public final boolean TRIGGER_LC_LOCALLY; // indicates that the replica should
                                              // initiate the LC protocol locally
+    public final boolean FORCE_LC_LOCALLY; // indicates that the replica should
+                                            // force a leader change trigger locally
 
     /**
      * Empty constructor
@@ -40,6 +42,7 @@ public class LCMessage extends SystemMessage {
     public LCMessage(){
     
         this.TRIGGER_LC_LOCALLY = false;
+        this.FORCE_LC_LOCALLY = false;
     }
 
 
@@ -57,6 +60,8 @@ public class LCMessage extends SystemMessage {
         this.payload = payload == null ? new byte[0] : payload;
         if (type == TOMUtil.TRIGGER_LC_LOCALLY && from == -1) this.TRIGGER_LC_LOCALLY = true;
         else this.TRIGGER_LC_LOCALLY  = false;
+        if (type == TOMUtil.FORCE_LC_LOCALLY && from == -1) this.FORCE_LC_LOCALLY = true;
+        else this.FORCE_LC_LOCALLY = false;
     }
 
     /**

@@ -61,6 +61,7 @@ public class TOMUtil {
 
     public static final int TRIGGER_LC_LOCALLY = 8;
     public static final int TRIGGER_SM_LOCALLY = 9;
+    public static final int FORCE_LC_LOCALLY = 10;
     
     private static boolean init = false;
         
