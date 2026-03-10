@@ -59,7 +59,6 @@ public class LCManager {
 
     //requests received in STOP messages
     private List<TOMMessage> requestsFromSTOP = null;
-    private final Object requestsLock = new Object();
     
     //data structures for info in stop, sync and catch-up messages
     private HashMap<Integer,HashSet<Integer>> stops;
@@ -137,13 +136,7 @@ public class LCManager {
      * @param currentRequestTimedOut Timed out requests in this replica
      */
     public void setCurrentRequestTimedOut(List<TOMMessage> currentRequestTimedOut) {
-        synchronized (requestsLock) {
-            if (currentRequestTimedOut == null) {
-                this.currentRequestTimedOut = null;
-            } else {
-                this.currentRequestTimedOut = new LinkedList<>(currentRequestTimedOut);
-            }
-        }
+        this.currentRequestTimedOut = currentRequestTimedOut;
     }
 
     /**
@@ -151,22 +144,15 @@ public class LCManager {
      * @return timed out requests in this replica
      */
     public List<TOMMessage> getCurrentRequestTimedOut() {
-        synchronized (requestsLock) {
-            if (currentRequestTimedOut == null) {
-                return null;
-            }
-            return new LinkedList<>(currentRequestTimedOut);
-        }
+        return currentRequestTimedOut;
     }
     
     /**
      * Discard timed out requests in this replica
      */
     public void clearCurrentRequestTimedOut() {
-        synchronized (requestsLock) {
-            if (currentRequestTimedOut != null) currentRequestTimedOut.clear();
-            currentRequestTimedOut = null;
-        }
+        if (currentRequestTimedOut != null) currentRequestTimedOut.clear();
+        currentRequestTimedOut = null;
     }
 
     /**
@@ -175,19 +161,11 @@ public class LCManager {
      * @param requestsFromSTOP Requests received in a STOP message
      */
     public void addRequestsFromSTOP(TOMMessage[] requestsFromSTOP) {
-        synchronized (requestsLock) {
-            if (this.requestsFromSTOP == null) {
-                this.requestsFromSTOP = new LinkedList<>();
-            }
-
-            if (requestsFromSTOP == null) {
-                return;
-            }
-
-            for (TOMMessage m : requestsFromSTOP) {
-                this.requestsFromSTOP.add(m);
-            }
-        }
+        if (this.requestsFromSTOP == null)
+            this.requestsFromSTOP = new LinkedList<>();
+        
+        for (TOMMessage m : requestsFromSTOP)
+            this.requestsFromSTOP.add(m);
     }
 
     /**
@@ -195,22 +173,15 @@ public class LCManager {
      * @return requests received in STOP messages
      */
     public List<TOMMessage> getRequestsFromSTOP() {
-        synchronized (requestsLock) {
-            if (requestsFromSTOP == null) {
-                return null;
-            }
-            return new LinkedList<>(requestsFromSTOP);
-        }
+        return requestsFromSTOP;
     }
     
     /**
      * Discard requests received in STOP messages
      */    
     public void clearRequestsFromSTOP() {
-        synchronized (requestsLock) {
-            if (requestsFromSTOP != null) requestsFromSTOP.clear();
-            requestsFromSTOP = null;
-        }
+        if (requestsFromSTOP != null) requestsFromSTOP.clear();
+        requestsFromSTOP = null;
     }
     
     
