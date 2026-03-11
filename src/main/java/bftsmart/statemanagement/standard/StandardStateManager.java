@@ -56,6 +56,7 @@ public class StandardStateManager extends StateManager {
     private ReentrantLock lockTimer = new ReentrantLock();
     private Timer stateTimer = null;
     private final static long INIT_TIMEOUT = 40000;
+    private final static long MAX_TIMEOUT = 300000; // 5 minutes cap for state-transfer retry backoff
     private long timeout = INIT_TIMEOUT;
 
     @Override
@@ -110,7 +111,11 @@ public class StandardStateManager extends StateManager {
         };
 
         stateTimer = new Timer("state timer");
-        timeout = timeout * 2;
+        if (timeout > (MAX_TIMEOUT / 2)) {
+            timeout = MAX_TIMEOUT;
+        } else {
+            timeout = timeout * 2;
+        }
         stateTimer.schedule(stateTask, timeout);
     }
 
