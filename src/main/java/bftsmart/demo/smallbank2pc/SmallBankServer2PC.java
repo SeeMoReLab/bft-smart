@@ -8,6 +8,7 @@ import java.io.ObjectInput;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutput;
 import java.io.ObjectOutputStream;
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -17,6 +18,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.TreeMap;
+import java.util.TreeSet;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,6 +32,7 @@ import bftsmart.rlrpc.Reward;
 import bftsmart.rlrpc.ReportLocal;
 import bftsmart.rlrpc.TimeoutRequest;
 import bftsmart.rlrpc.TimeoutStatus;
+import bftsmart.rlrpc.TwoPcNeighborPrepareTimeout;
 import bftsmart.rlrpc.TwoPcOverPbftReport;
 import bftsmart.rlrpc.TwoPcOverPbftReward;
 import bftsmart.rlrpc.TwoPcOverPbftTimeout;
@@ -76,9 +80,11 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     private volatile int pollerEpisode = -1;
     private int currentTimeoutMs = -1;
     private int lastTimeoutUsedMs = -1;
+    private Map<Integer, Integer> lastPrepareTimeoutsUsedByShard = new HashMap<>();
     private TwoPcOverPbftReport pendingRewardReport;
     private int pendingRewardEpisode;
     private int pendingRewardTimeoutMs;
+    private Map<Integer, Integer> pendingRewardPrepareTimeoutsByShard = new HashMap<>();
     private int singleShardTransactionCount;
     private final boolean learning;
 
@@ -102,12 +108,20 @@ public class SmallBankServer2PC extends DefaultRecoverable {
 
     private static final class TimeoutDecision {
         private final int timeoutMs;
+        private final Map<Integer, Integer> prepareTimeoutsByShard;
         private final int startTick;
         private final int reportSeq;
         private final int reportLength;
 
-        private TimeoutDecision(int timeoutMs, int startTick, int reportSeq, int reportLength) {
+        private TimeoutDecision(
+                int timeoutMs,
+                Map<Integer, Integer> prepareTimeoutsByShard,
+                int startTick,
+                int reportSeq,
+                int reportLength
+        ) {
             this.timeoutMs = timeoutMs;
+            this.prepareTimeoutsByShard = new HashMap<>(prepareTimeoutsByShard);
             this.startTick = startTick;
             this.reportSeq = reportSeq;
             this.reportLength = reportLength;
@@ -138,10 +152,12 @@ public class SmallBankServer2PC extends DefaultRecoverable {
      * - COMMIT: execute transaction + release locks
      * - ABORT: just release locks
      */
-    private static class PendingTransaction {
+    private static class PendingTransaction implements Serializable {
+        private static final long serialVersionUID = 1L;
+
         final String transactionId;
         final Set<Long> lockedAccountIds;
-        final long prepareTime;
+        transient long prepareTime;
 
         // Transaction details (needed for execution on commit)
         final SmallBankMessage2PC.TransactionType txType;
@@ -152,11 +168,18 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                           SmallBankMessage2PC.TransactionType txType,
                           long customerId, double amount) {
             this.transactionId = txId;
-            this.lockedAccountIds = locks;
+            // Preserve deterministic ordering if this object is serialized in snapshots.
+            this.lockedAccountIds = new TreeSet<>(locks);
             this.prepareTime = System.currentTimeMillis();
             this.txType = txType;
             this.customerId = customerId;
             this.amount = amount;
+        }
+
+        private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
+            in.defaultReadObject();
+            // Reset wall-clock based metric timing on restore.
+            this.prepareTime = System.currentTimeMillis();
         }
     }
 
@@ -308,6 +331,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             currentTimeoutMs = ctx.getSVController().getStaticConf().getRequestTimeout();
             lastTimeoutUsedMs = currentTimeoutMs;
         }
+        lastPrepareTimeoutsUsedByShard = snapshotPrepareTimeoutsByShard();
     }
 
     @Override
@@ -318,7 +342,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         for (byte[] command : commands) {
             MessageContext currentMsgCtx = (msgCtx != null) ? msgCtx[index] : null;
             if (currentMsgCtx != null && currentMsgCtx.getConsensusId() % 1000 == 0 && !logPrinted) {
-                System.out.println("SmallBankServer2PC executing CID: " + currentMsgCtx.getConsensusId());
+                logger.debug("SmallBankServer2PC executing CID {}", currentMsgCtx.getConsensusId());
                 logPrinted = true;
             } else {
                 logPrinted = false;
@@ -377,7 +401,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                         } else {
                             double balance = checking.get(custId) + request.getAmount();
                             checking.put(custId, balance);
-                            System.out.println("New checking balance for customer " + custId + ": " + balance);
+                            logger.debug("New checking balance for customer {}: {}", custId, balance);
                             reply = SmallBankMessage2PC.newResponse(0);
                         }
                         break;
@@ -504,14 +528,38 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         try {
             ByteArrayInputStream bis = new ByteArrayInputStream(state);
             ObjectInput in = new ObjectInputStream(bis);
-            accounts = (HashMap<Long, String>) in.readObject();
-            checking = (HashMap<Long, Double>) in.readObject();
-            savings = (HashMap<Long, Double>) in.readObject();
+            Map<Long, String> snapshotAccounts = (Map<Long, String>) in.readObject();
+            Map<Long, Double> snapshotChecking = (Map<Long, Double>) in.readObject();
+            Map<Long, Double> snapshotSavings = (Map<Long, Double>) in.readObject();
+            accounts = new HashMap<>(snapshotAccounts);
+            checking = new HashMap<>(snapshotChecking);
+            savings = new HashMap<>(snapshotSavings);
             try {
                 iterations = in.readLong();
             } catch (EOFException e) {
                 iterations = 0;
             }
+
+            Map<String, PendingTransaction> snapshotPendingTransactions = new HashMap<>();
+            Set<Long> snapshotLockedAccounts = new HashSet<>();
+            try {
+                Map<String, PendingTransaction> pending = (Map<String, PendingTransaction>) in.readObject();
+                Set<Long> locked = (Set<Long>) in.readObject();
+                if (pending != null) {
+                    snapshotPendingTransactions.putAll(pending);
+                }
+                if (locked != null) {
+                    snapshotLockedAccounts.addAll(locked);
+                }
+            } catch (EOFException e) {
+                // Backward compatibility with snapshots that don't include in-flight 2PC state.
+            }
+
+            pendingTransactions.clear();
+            pendingTransactions.putAll(snapshotPendingTransactions);
+            lockedAccounts.clear();
+            lockedAccounts.addAll(snapshotLockedAccounts);
+
             in.close();
             bis.close();
         } catch (IOException | ClassNotFoundException e) {
@@ -525,10 +573,13 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         try {
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             ObjectOutput out = new ObjectOutputStream(bos);
-            out.writeObject(accounts);
-            out.writeObject(checking);
-            out.writeObject(savings);
+            // Serialize maps/sets using deterministic ordering so snapshot hashes match across replicas.
+            out.writeObject(new TreeMap<>(accounts));
+            out.writeObject(new TreeMap<>(checking));
+            out.writeObject(new TreeMap<>(savings));
             out.writeLong(iterations);
+            out.writeObject(new TreeMap<>(pendingTransactions));
+            out.writeObject(new TreeSet<>(lockedAccounts));
             out.flush();
             bos.flush();
             out.close();
@@ -547,9 +598,8 @@ public class SmallBankServer2PC extends DefaultRecoverable {
      * Main dispatcher for 2PC messages.
      */
     private SmallBankMessage2PC handle2PCMessage(SmallBankMessage2PC request) {
-        System.out.println("[INFO] Handling 2PC message: " + request);
-        System.out.println("[INFO] Current locked accounts: " + lockedAccounts);
-        System.out.println("[INFO] TwoPhaseType: " + request.getTwoPhaseType());
+        logger.debug("Handling 2PC message: type={}, txId={}, lockedAccountCount={}",
+                request.getTwoPhaseType(), request.getTransactionId(), lockedAccounts.size());
         switch (request.getTwoPhaseType()) {
             case PREPARE:
                 return handlePrepare(request);
@@ -570,12 +620,12 @@ public class SmallBankServer2PC extends DefaultRecoverable {
      */
     private SmallBankMessage2PC handlePrepare(SmallBankMessage2PC request) {
         String txId = request.getTransactionId();
-        logger.info("PREPARE received for txId={}, type={}, customerId={}, amount={}",
+        logger.debug("PREPARE received for txId={}, type={}, customerId={}, amount={}",
                    txId, request.getTxType(), request.getCustomerId(), request.getAmount());
 
         // Check if we already have this transaction prepared
         if (pendingTransactions.containsKey(txId)) {
-            logger.info("Transaction {} already prepared", txId);
+            logger.debug("Transaction {} already prepared", txId);
             return SmallBankMessage2PC.newPrepareOk(txId);
         }
 
@@ -588,7 +638,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         recordParticipantLockWait(System.nanoTime() - lockWaitStartNs);
         if (!lockAcquired) {
             recordParticipantLockContention();
-            logger.info("Cannot acquire locks for transaction {}, accounts {} are locked", txId, accountsToLock);
+            logger.debug("Cannot acquire locks for transaction {}, accounts {} are locked", txId, accountsToLock);
             return SmallBankMessage2PC.newPrepareFail(txId, "Cannot acquire locks - accounts busy");
         }
 
@@ -597,7 +647,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         if (validationError != null) {
             // Release locks on validation failure
             releaseLocks(accountsToLock);
-            logger.info("Validation failed for transaction {}: {}", txId, validationError);
+            logger.debug("Validation failed for transaction {}: {}", txId, validationError);
             return SmallBankMessage2PC.newPrepareFail(txId, validationError);
         }
 
@@ -609,7 +659,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         );
         pendingTransactions.put(txId, pending);
 
-        logger.info("PREPARE successful for txId={}", txId);
+        logger.debug("PREPARE successful for txId={}", txId);
         return SmallBankMessage2PC.newPrepareOk(txId);
     }
 
@@ -620,7 +670,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
      */
     private SmallBankMessage2PC handleCommit(SmallBankMessage2PC request) {
         String txId = request.getTransactionId();
-        logger.info("COMMIT received for txId={}, type={}, customerId={}, amount={}",
+        logger.debug("COMMIT received for txId={}, type={}, customerId={}, amount={}",
                    txId, request.getTxType(), request.getCustomerId(), request.getAmount());
 
         PendingTransaction pending = pendingTransactions.remove(txId);
@@ -649,7 +699,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         // Release locks
         releaseLocks(pending.lockedAccountIds);
 
-        logger.info("COMMIT successful for txId={}", txId);
+        logger.debug("COMMIT successful for txId={}", txId);
         return SmallBankMessage2PC.newAck(txId);
     }
 
@@ -694,7 +744,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
      */
     private SmallBankMessage2PC handleAbort(SmallBankMessage2PC request) {
         String txId = request.getTransactionId();
-        logger.info("ABORT received for txId={}", txId);
+        logger.debug("ABORT received for txId={}", txId);
 
         PendingTransaction pending = pendingTransactions.remove(txId);
         if (pending == null) {
@@ -706,7 +756,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         recordParticipantLockHold(pending);
         releaseLocks(pending.lockedAccountIds);
 
-        logger.info("ABORT successful for txId={}", txId);
+        logger.debug("ABORT successful for txId={}", txId);
         return SmallBankMessage2PC.newAck(txId);
     }
 
@@ -735,7 +785,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             } else {
                 // Failed to acquire lock - release all acquired locks
                 for (Long acquired : acquiredLocks) {
-                    logger.info("Releasing lock on account {} due to failure to acquire lock on account {}", acquired, accountId);
+                    logger.debug("Releasing lock on account {} due to failure to acquire lock on account {}", acquired, accountId);
                     lockedAccounts.remove(acquired);
                 }
                 return false;
@@ -932,17 +982,19 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         waitingForRecommendation = false;
         stopTimeoutPolling();
         logger.info(
-                "[learning] received recommendation: episode={} report_seq={} apply_tick={} reward_tick={} timeout_ms={} current_cid={}",
+                "[learning] received recommendation: episode={} report_seq={} apply_tick={} reward_tick={} timeout_ms={} prepare_timeouts={} current_cid={}",
                 currentEpisode,
                 selectedWindow.reportSeq,
                 selectedWindow.applyTick,
                 selectedWindow.rewardTick,
                 decision.timeoutMs,
+                formatPrepareTimeoutsByShard(decision.prepareTimeoutsByShard),
                 consensusId
         );
         if (consensusId > selectedWindow.applyTick) {
             applyHandledForEpisode = true;
             lastTimeoutUsedMs = currentTimeoutMs;
+            lastPrepareTimeoutsUsedByShard = snapshotPrepareTimeoutsByShard();
             logger.info(
                     "[learning] ignored late recommendation: episode={} report_seq={} apply_tick={} current_cid={}",
                     currentEpisode,
@@ -965,27 +1017,31 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             if (consensusId == selectedWindow.applyTick && pollerDecision != null) {
                 currentTimeoutMs = pollerDecision.timeoutMs;
                 replica.getRequestsTimer().setShortTimeoutPreservingEffectiveTimeout(currentTimeoutMs);
+                applyPrepareTimeouts(pollerDecision.prepareTimeoutsByShard);
                 appliedRecommendation = true;
             }
             applyHandledForEpisode = true;
             lastTimeoutUsedMs = currentTimeoutMs;
             if (appliedRecommendation) {
                 logger.info(
-                        "[learning] applied recommendation on time: episode={} report_seq={} apply_tick={} current_cid={} timeout_ms={}",
+                        "[learning] applied recommendation on time: episode={} report_seq={} apply_tick={} current_cid={} timeout_ms={} prepare_timeouts={}",
                         currentEpisode,
                         selectedWindow.reportSeq,
                         selectedWindow.applyTick,
                         consensusId,
-                        currentTimeoutMs
+                        currentTimeoutMs,
+                        formatPrepareTimeoutsByShard(lastPrepareTimeoutsUsedByShard)
                 );
             } else {
+                lastPrepareTimeoutsUsedByShard = snapshotPrepareTimeoutsByShard();
                 logger.info(
-                        "[learning] apply deadline reached without recommendation update: episode={} report_seq={} apply_tick={} current_cid={} timeout_ms={}",
+                        "[learning] apply deadline reached without recommendation update: episode={} report_seq={} apply_tick={} current_cid={} timeout_ms={} prepare_timeouts={}",
                         currentEpisode,
                         selectedWindow.reportSeq,
                         selectedWindow.applyTick,
                         consensusId,
-                        currentTimeoutMs
+                        currentTimeoutMs,
+                        formatPrepareTimeoutsByShard(lastPrepareTimeoutsUsedByShard)
                 );
             }
             return;
@@ -994,13 +1050,15 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             waitingForRecommendation = false;
             applyHandledForEpisode = true;
             lastTimeoutUsedMs = currentTimeoutMs;
+            lastPrepareTimeoutsUsedByShard = snapshotPrepareTimeoutsByShard();
             stopTimeoutPolling();
             logger.info(
-                    "[learning] recommendation unavailable at cap apply deadline: episode={} cap_apply_tick={} current_cid={} timeout_ms={}",
+                    "[learning] recommendation unavailable at cap apply deadline: episode={} cap_apply_tick={} current_cid={} timeout_ms={} prepare_timeouts={}",
                     currentEpisode,
                     capApplyDeadlineTick,
                     consensusId,
-                    currentTimeoutMs
+                    currentTimeoutMs,
+                    formatPrepareTimeoutsByShard(lastPrepareTimeoutsUsedByShard)
             );
         }
     }
@@ -1070,14 +1128,28 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                 .setTwoPcOverPbftState(report);
 
         if (pendingRewardReport != null) {
-            int prepareTimeoutMs = getPrepareTimeoutMs();
+            Map<Integer, Integer> rewardPrepareTimeoutsByShard = pendingRewardPrepareTimeoutsByShard;
+            if (rewardPrepareTimeoutsByShard == null || rewardPrepareTimeoutsByShard.isEmpty()) {
+                rewardPrepareTimeoutsByShard = snapshotPrepareTimeoutsByShard();
+            }
+            TwoPcOverPbftTimeout.Builder timeoutBuilder = TwoPcOverPbftTimeout.newBuilder()
+                    .setElectionTimeoutMilliseconds(Math.max(0, pendingRewardTimeoutMs));
+            List<Integer> participantShardIds = new ArrayList<>(rewardPrepareTimeoutsByShard.keySet());
+            Collections.sort(participantShardIds);
+            for (int participantShardId : participantShardIds) {
+                timeoutBuilder.addPrepareTimeouts(
+                        TwoPcNeighborPrepareTimeout.newBuilder()
+                                .setParticipantShardId(participantShardId)
+                                .setPrepareTimeoutMilliseconds(
+                                        Math.max(0, rewardPrepareTimeoutsByShard.get(participantShardId))
+                                )
+                                .build()
+                );
+            }
             TwoPcOverPbftReward twoPcReward = TwoPcOverPbftReward.newBuilder()
                     .setEpisode(pendingRewardEpisode)
                     .setReport(pendingRewardReport)
-                    .setTimeoutUsed(TwoPcOverPbftTimeout.newBuilder()
-                            .setElectionTimeoutMilliseconds(Math.max(0, pendingRewardTimeoutMs))
-                            .setPrepareTimeoutMilliseconds(Math.max(0, prepareTimeoutMs))
-                            .build())
+                    .setTimeoutUsed(timeoutBuilder.build())
                     .build();
             Reward reward = Reward.newBuilder()
                     .setTwoPcOverPbft(twoPcReward)
@@ -1089,6 +1161,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             learnerStub.sendReport(localBuilder.build());
             if (pendingRewardReport != null) {
                 pendingRewardReport = null;
+                pendingRewardPrepareTimeoutsByShard = new HashMap<>();
             }
         } catch (Exception e) {
             logger.warn("Exception in sending report to agent: {}", e.getMessage());
@@ -1146,19 +1219,36 @@ public class SmallBankServer2PC extends DefaultRecoverable {
                         && status.getTimeout().hasTwoPcOverPbft()) {
                     int timeoutMs = (int) status.getTimeout().getTwoPcOverPbft()
                             .getElectionTimeoutMilliseconds();
+                    Map<Integer, Integer> prepareTimeoutsByShard = new HashMap<>();
+                    for (TwoPcNeighborPrepareTimeout prepareTimeout
+                            : status.getTimeout().getTwoPcOverPbft().getPrepareTimeoutsList()) {
+                        int participantShardId = (int) prepareTimeout.getParticipantShardId();
+                        int prepareTimeoutMs = (int) prepareTimeout.getPrepareTimeoutMilliseconds();
+                        if (participantShardId < 0 || prepareTimeoutMs <= 0) {
+                            continue;
+                        }
+                        prepareTimeoutsByShard.put(participantShardId, prepareTimeoutMs);
+                    }
                     int startTick = (int) status.getStartTick();
                     int reportSeq = (int) status.getReportSeq();
                     int reportLength = reportSeq - startTick;
                     if (reportSeq > startTick && reportLength > 0
                             && !pollerStopRequested && pollerEpisode == episode) {
-                        pollerDecision = new TimeoutDecision(timeoutMs, startTick, reportSeq, reportLength);
+                        pollerDecision = new TimeoutDecision(
+                                timeoutMs,
+                                prepareTimeoutsByShard,
+                                startTick,
+                                reportSeq,
+                                reportLength
+                        );
                         logger.info(
-                                "[learning] timeout READY: episode={} start_tick={} report_seq={} report_length={} timeout_ms={}",
+                                "[learning] timeout READY: episode={} start_tick={} report_seq={} report_length={} timeout_ms={} prepare_timeouts={}",
                                 episode,
                                 startTick,
                                 reportSeq,
                                 reportLength,
-                                timeoutMs
+                                timeoutMs,
+                                formatPrepareTimeoutsByShard(prepareTimeoutsByShard)
                         );
                         return;
                     }
@@ -1186,6 +1276,7 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         pendingRewardReport = rewardReport;
         pendingRewardEpisode = episode;
         pendingRewardTimeoutMs = lastTimeoutUsedMs;
+        pendingRewardPrepareTimeoutsByShard = new HashMap<>(lastPrepareTimeoutsUsedByShard);
     }
 
     private void resetWindowMetrics() {
@@ -1225,11 +1316,36 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         }
     }
 
-    private int getPrepareTimeoutMs() {
+    private void applyPrepareTimeouts(Map<Integer, Integer> prepareTimeoutsByShard) {
         ShardHandler shardHandler = replica != null ? replica.getShardHandler() : null;
         if (shardHandler == null) {
-            return 0;
+            lastPrepareTimeoutsUsedByShard = new HashMap<>();
+            return;
         }
-        return Math.max(0, shardHandler.getTimeoutMs());
+        if (prepareTimeoutsByShard != null && !prepareTimeoutsByShard.isEmpty()) {
+            shardHandler.setTimeoutMsByShard(prepareTimeoutsByShard);
+        }
+        lastPrepareTimeoutsUsedByShard = shardHandler.getTimeoutMsByShardSnapshot();
+    }
+
+    private Map<Integer, Integer> snapshotPrepareTimeoutsByShard() {
+        ShardHandler shardHandler = replica != null ? replica.getShardHandler() : null;
+        if (shardHandler == null) {
+            return new HashMap<>();
+        }
+        return shardHandler.getTimeoutMsByShardSnapshot();
+    }
+
+    private String formatPrepareTimeoutsByShard(Map<Integer, Integer> prepareTimeoutsByShard) {
+        if (prepareTimeoutsByShard == null || prepareTimeoutsByShard.isEmpty()) {
+            return "none";
+        }
+        List<Integer> participantShardIds = new ArrayList<>(prepareTimeoutsByShard.keySet());
+        Collections.sort(participantShardIds);
+        List<String> parts = new ArrayList<>();
+        for (int participantShardId : participantShardIds) {
+            parts.add(participantShardId + ":" + Math.max(0, prepareTimeoutsByShard.get(participantShardId)));
+        }
+        return String.join(",", parts);
     }
 }

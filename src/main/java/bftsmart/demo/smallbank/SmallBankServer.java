@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
 import bftsmart.demo.util.TimeoutLearningWindowMetrics;
@@ -440,9 +441,12 @@ public class SmallBankServer extends DefaultRecoverable {
         try {
             ByteArrayInputStream bis = new ByteArrayInputStream(state);
             ObjectInput in = new ObjectInputStream(bis);
-            accounts = (HashMap<Long, String>) in.readObject();
-            checking = (HashMap<Long, Double>) in.readObject();
-            savings = (HashMap<Long, Double>) in.readObject();
+            Map<Long, String> snapshotAccounts = (Map<Long, String>) in.readObject();
+            Map<Long, Double> snapshotChecking = (Map<Long, Double>) in.readObject();
+            Map<Long, Double> snapshotSavings = (Map<Long, Double>) in.readObject();
+            accounts = new HashMap<>(snapshotAccounts);
+            checking = new HashMap<>(snapshotChecking);
+            savings = new HashMap<>(snapshotSavings);
             try {
                 iterations = in.readLong();
             } catch (EOFException e) {
@@ -461,9 +465,10 @@ public class SmallBankServer extends DefaultRecoverable {
         try {
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             ObjectOutput out = new ObjectOutputStream(bos);
-            out.writeObject(accounts);
-            out.writeObject(checking);
-            out.writeObject(savings);
+            // Serialize maps using deterministic key order so snapshot hashes match across replicas.
+            out.writeObject(new TreeMap<>(accounts));
+            out.writeObject(new TreeMap<>(checking));
+            out.writeObject(new TreeMap<>(savings));
             out.writeLong(iterations);
             out.flush();
             bos.flush();

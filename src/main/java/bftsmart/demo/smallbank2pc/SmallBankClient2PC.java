@@ -1,5 +1,6 @@
 package bftsmart.demo.smallbank2pc;
 
+import bftsmart.demo.util.Histogram;
 import bftsmart.tom.ServiceProxy;
 import org.apache.commons.cli.*;
 import org.apache.commons.configuration2.HierarchicalConfiguration;
@@ -20,6 +21,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * SmallBank Client for BFT-SMaRt with 2PC support for cross-shard transactions.
@@ -30,8 +32,10 @@ import java.util.concurrent.atomic.AtomicLong;
  *    and cross-shard transactions use 2PC protocol
  */
 public class SmallBankClient2PC {
+    private final Logger measurementLogger = LoggerFactory.getLogger("measurement");
     private static final Logger LOG = LoggerFactory.getLogger(SmallBankClient2PC.class);
     private static final String SINGLE_LINE = "======================================================================";
+    private static final int MAX_LATENCY_MS = 10_000;
     private static final String DEFAULT_CONFIG_HOME = "config";
     private static final String WORKLOAD_FILE_NAME = "smallbank.xml";
     private static final int ACCOUNT_CREATION_TERMINALS = 100;
@@ -47,13 +51,17 @@ public class SmallBankClient2PC {
 
     // Statistics
     private final AtomicInteger successCount = new AtomicInteger(0);
+    private final AtomicInteger abortCount = new AtomicInteger(0);
     private final AtomicInteger errorCount = new AtomicInteger(0);
     private final AtomicInteger crossShardCount = new AtomicInteger(0);
     private final AtomicLong totalLatency = new AtomicLong(0);
-    private final List<Long> latencies = new CopyOnWriteArrayList<>();
+    private final Histogram<Long> latencyHistogram = new Histogram<>();
 
-    // Transaction ID generator
-    private final AtomicLong txIdCounter = new AtomicLong(0);
+    private enum TxOutcome {
+        SUCCESS,
+        ABORTED,
+        ERROR
+    }
 
     public static void main(String[] args) {
         try {
@@ -261,17 +269,18 @@ public class SmallBankClient2PC {
     private void executeWorkload(int phaseNum) {
         // Reset statistics for this phase
         successCount.set(0);
+        abortCount.set(0);
         errorCount.set(0);
         crossShardCount.set(0);
         totalLatency.set(0);
-        latencies.clear();
-
-        ExecutorService executor = Executors.newFixedThreadPool(config.terminals + 1);
-        CountDownLatch startLatch = new CountDownLatch(1);
-        CountDownLatch completionLatch = new CountDownLatch(config.terminals);
+        latencyHistogram.clear();
 
         int terminals = (config.phases[phaseNum].terminals == -1) ?
                         config.terminals : config.phases[phaseNum].terminals;
+
+        ExecutorService executor = Executors.newFixedThreadPool(terminals);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch completionLatch = new CountDownLatch(terminals);
 
         System.out.printf("Starting %d terminals for %d seconds%n", terminals, config.phases[phaseNum].duration);
         if (config.phases[phaseNum].rate == 0.0) {
@@ -297,19 +306,29 @@ public class SmallBankClient2PC {
         }
 
         System.out.println("All terminals ready. Starting workload...");
+        MetricsSnapshot phaseBaseline = captureSnapshot();
+        ScheduledExecutorService monitorExec = startMonitor(phaseNum, phaseBaseline);
         long workloadStart = System.nanoTime();
         startLatch.countDown();
 
         try {
-            completionLatch.await(config.phases[phaseNum].duration + 10, TimeUnit.SECONDS);
+            boolean completed = completionLatch.await(config.phases[phaseNum].duration + 10L, TimeUnit.SECONDS);
+            if (!completed) {
+                LOG.warn("Workload phase {} did not complete before timeout", phaseNum + 1);
+            }
         } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             LOG.error("Interrupted while waiting for completion", e);
         }
 
         executor.shutdownNow();
+        if (monitorExec != null) {
+            monitorExec.shutdownNow();
+        }
         long workloadEnd = System.nanoTime();
-
-        printResults(phaseNum, workloadStart, workloadEnd);
+        MetricsSnapshot phaseAfter = captureSnapshot();
+        MetricsSnapshot phaseDelta = computeDelta(phaseBaseline, phaseAfter);
+        printResults("Phase " + (phaseNum + 1), (workloadEnd - workloadStart) / 1_000_000_000.0, phaseDelta);
     }
 
     private void runTerminal(int terminalId, int phaseNum) {
@@ -340,14 +359,16 @@ public class SmallBankClient2PC {
                     terminalRandom, config.phases[phaseNum].weights);
 
             long txStart = System.nanoTime();
-            boolean success = executeTransaction(txType, terminalRandom);
+            TxOutcome outcome = executeTransaction(txType, terminalRandom);
             long txEnd = System.nanoTime();
 
-            if (success) {
+            if (outcome == TxOutcome.SUCCESS) {
                 successCount.incrementAndGet();
                 long latency = txEnd - txStart;
                 totalLatency.addAndGet(latency);
-                latencies.add(latency / 1_000_000);
+                recordLatency(latency);
+            } else if (outcome == TxOutcome.ABORTED) {
+                abortCount.incrementAndGet();
             } else {
                 errorCount.incrementAndGet();
             }
@@ -365,7 +386,7 @@ public class SmallBankClient2PC {
             }
         }
 
-        System.out.printf("Terminal %d completed %d transactions%n", terminalId, txCount);
+        LOG.debug("Terminal {} completed {} transactions in phase {}", terminalId, txCount, phaseNum + 1);
     }
 
     private SmallBankMessage2PC.TransactionType selectTransactionType(Random rnd, int[] weights) {
@@ -387,7 +408,7 @@ public class SmallBankClient2PC {
         return SmallBankMessage2PC.TransactionType.WRITE_CHECK;
     }
 
-    private boolean executeTransaction(SmallBankMessage2PC.TransactionType type, Random rnd) {
+    private TxOutcome executeTransaction(SmallBankMessage2PC.TransactionType type, Random rnd) {
         try {
             long custId1 = rnd.nextInt(config.numAccounts);
             long custId2 = rnd.nextInt(config.numAccounts);
@@ -401,12 +422,13 @@ public class SmallBankClient2PC {
                 crossShardCount.incrementAndGet();
                 return executeCrossShardTransaction(type, custId1, custId2, amount);
             } else {
-                return executeSingleShardTransaction(type, custId1, custId2, amount);
+                return executeSingleShardTransaction(type, custId1, custId2, amount)
+                        ? TxOutcome.SUCCESS : TxOutcome.ERROR;
             }
 
         } catch (Exception e) {
             LOG.error("Error executing transaction {}", type, e);
-            return false;
+            return TxOutcome.ERROR;
         }
     }
 
@@ -424,12 +446,12 @@ public class SmallBankClient2PC {
         if (type == SmallBankMessage2PC.TransactionType.BALANCE) {
             byte[] reply = proxy.invokeUnordered(msg.getBytes());
             SmallBankMessage2PC response = SmallBankMessage2PC.getObject(reply);
-            return response != null && response.getResult() == 0;
+            return isSuccessOrExpectedBusinessOutcome(response);
         }
 
         byte[] reply = proxy.invokeOrdered(msg.getBytes());
         SmallBankMessage2PC response = SmallBankMessage2PC.getObject(reply);
-        return response != null && response.getResult() == 0;
+        return isSuccessOrExpectedBusinessOutcome(response);
     }
 
     /**
@@ -437,8 +459,8 @@ public class SmallBankClient2PC {
      * Sends CROSS_SHARD_REQUEST to the coordinator shard (shard containing sender account).
      * The leader of that shard will coordinate the 2PC.
      */
-    private boolean executeCrossShardTransaction(SmallBankMessage2PC.TransactionType type,
-                                                  long custId1, long custId2, double amount) {
+    private TxOutcome executeCrossShardTransaction(SmallBankMessage2PC.TransactionType type,
+                                                   long custId1, long custId2, double amount) {
         // Send to coordinator shard (shard of sender/source account)
         int coordinatorShard = getShardForAccount(custId1);
 
@@ -452,7 +474,53 @@ public class SmallBankClient2PC {
         byte[] reply = proxy.invokeCrossShardRequest(request.getBytes());
 
         SmallBankMessage2PC response = SmallBankMessage2PC.getObject(reply);
-        return response != null && response.getResult() == 0;
+        if (response == null) {
+            return TxOutcome.ERROR;
+        }
+        if (response.getResult() == 0) {
+            return TxOutcome.SUCCESS;
+        }
+        if (isInsufficientFundsResponse(response)) {
+            return TxOutcome.SUCCESS;
+        }
+        if (is2pcAbortResponse(response)) {
+            return TxOutcome.ABORTED;
+        }
+        return TxOutcome.ERROR;
+    }
+
+    private boolean isSuccessOrExpectedBusinessOutcome(SmallBankMessage2PC response) {
+        if (response == null) {
+            return false;
+        }
+        return response.getResult() == 0 || isInsufficientFundsResponse(response);
+    }
+
+    private boolean isInsufficientFundsResponse(SmallBankMessage2PC response) {
+        if (response == null) {
+            return false;
+        }
+        String errorMsg = response.getErrorMsg();
+        if (errorMsg == null) {
+            return false;
+        }
+        return errorMsg.toLowerCase(Locale.ROOT).contains("insufficient funds");
+    }
+
+    private boolean is2pcAbortResponse(SmallBankMessage2PC response) {
+        if (response == null) {
+            return false;
+        }
+        String errorMsg = response.getErrorMsg();
+        if (errorMsg == null) {
+            return false;
+        }
+        String normalized = errorMsg.toLowerCase(Locale.ROOT);
+        return normalized.contains("2pc prepare failed")
+                || normalized.contains("2pc prepare timeout")
+                || normalized.contains("prepare failed")
+                || normalized.contains("prepare timeout")
+                || normalized.contains("abort");
     }
 
     /**
@@ -481,39 +549,128 @@ public class SmallBankClient2PC {
 
     // Results
 
-    private void printResults(int phaseNum, long startNs, long endNs) {
-        double durationSeconds = (endNs - startNs) / 1_000_000_000.0;
-        int totalTxns = successCount.get() + errorCount.get();
-        double throughput = totalTxns / durationSeconds;
-        double avgLatency = successCount.get() > 0 ?
-                           totalLatency.get() / 1_000_000.0 / successCount.get() : 0;
+    private void printResults(String label, double durationSeconds, MetricsSnapshot delta) {
+        int totalTxns = (int) (delta.success + delta.aborted + delta.errors);
+        double throughput = durationSeconds == 0 ? 0 : totalTxns / durationSeconds;
+        double avgLatency = delta.success == 0 ? 0 : delta.totalLatencyNs / 1_000_000.0 / delta.success;
 
-        Collections.sort(latencies);
-        long p50 = getPercentile(latencies, 0.50);
-        long p95 = getPercentile(latencies, 0.95);
-        long p99 = getPercentile(latencies, 0.99);
+        long p50 = getPercentileFromHistogram(delta.latencyHistogram, delta.success, 0.50);
+        long p95 = getPercentileFromHistogram(delta.latencyHistogram, delta.success, 0.95);
+        long p99 = getPercentileFromHistogram(delta.latencyHistogram, delta.success, 0.99);
 
-        System.out.println(SINGLE_LINE);
-        System.out.printf("Phase %d Results%n", phaseNum);
-        System.out.println(SINGLE_LINE);
-        System.out.printf("Duration: %.2f seconds%n", durationSeconds);
-        System.out.printf("Total Transactions: %d%n", totalTxns);
-        System.out.printf("Successful: %d%n", successCount.get());
-        System.out.printf("Errors: %d%n", errorCount.get());
-        System.out.printf("Cross-shard transactions: %d%n", crossShardCount.get());
-        System.out.printf("Throughput: %.2f TPS%n", throughput);
-        System.out.printf("Average Latency: %.2f ms%n", avgLatency);
-        System.out.printf("P50 Latency: %d ms%n", p50);
-        System.out.printf("P95 Latency: %d ms%n", p95);
-        System.out.printf("P99 Latency: %d ms%n", p99);
-        System.out.println(SINGLE_LINE);
+        if (label.startsWith("Monitor")) {
+            measurementLogger.info(
+                    "{} duration={}s trxs={} succ={} aborted={} err={} cross_shard={} tps={} avg_ms={} p50={} p95={} p99={}",
+                    label, durationSeconds, totalTxns, delta.success, delta.aborted, delta.errors, delta.crossShard, throughput,
+                    avgLatency, p50, p95, p99);
+            return;
+        }
+
+        measurementLogger.info(SINGLE_LINE);
+        measurementLogger.info("{} results:", label);
+        measurementLogger.info(
+                "duration: {} seconds, total trxs: {}, successful: {}, aborted: {}, errors: {}, cross-shard: {}",
+                durationSeconds, totalTxns, delta.success, delta.aborted, delta.errors, delta.crossShard);
+        measurementLogger.info(
+                "throughput: {} TPS, avg_latency: {} ms, p50: {} ms, p95: {} ms, p99: {} ms",
+                throughput, avgLatency, p50, p95, p99);
+        measurementLogger.info(SINGLE_LINE);
     }
 
-    private long getPercentile(List<Long> sortedValues, double percentile) {
-        if (sortedValues.isEmpty()) return 0;
-        int index = (int) Math.ceil(percentile * sortedValues.size()) - 1;
-        index = Math.max(0, Math.min(index, sortedValues.size() - 1));
-        return sortedValues.get(index);
+    private long getPercentileFromHistogram(Histogram<Long> histogram, long successes, double percentile) {
+        if (successes == 0) {
+            return 0;
+        }
+
+        long target = (long) Math.ceil(percentile * successes);
+        long cumulative = 0;
+        synchronized (histogram) {
+            for (Long bucket : histogram.values()) {
+                int count = histogram.get(bucket, 0);
+                cumulative += count;
+                if (cumulative >= target) {
+                    return bucket;
+                }
+            }
+        }
+        return MAX_LATENCY_MS;
+    }
+
+    private void recordLatency(long latencyNs) {
+        long latencyMs = TimeUnit.NANOSECONDS.toMillis(latencyNs);
+        long bucket = Math.min(latencyMs, MAX_LATENCY_MS);
+        latencyHistogram.put(bucket);
+    }
+
+    private MetricsSnapshot captureSnapshot() {
+        return new MetricsSnapshot(
+                successCount.get(),
+                abortCount.get(),
+                errorCount.get(),
+                crossShardCount.get(),
+                totalLatency.get(),
+                copyHistogram(latencyHistogram));
+    }
+
+    private MetricsSnapshot computeDelta(MetricsSnapshot before, MetricsSnapshot after) {
+        long successDelta = after.success - before.success;
+        long abortDelta = after.aborted - before.aborted;
+        long errorDelta = after.errors - before.errors;
+        long crossShardDelta = after.crossShard - before.crossShard;
+        long latencyDelta = after.totalLatencyNs - before.totalLatencyNs;
+        Histogram<Long> deltaHistogram = diffHistogram(before.latencyHistogram, after.latencyHistogram);
+        return new MetricsSnapshot(successDelta, abortDelta, errorDelta, crossShardDelta, latencyDelta, deltaHistogram);
+    }
+
+    private Histogram<Long> copyHistogram(Histogram<Long> source) {
+        Histogram<Long> copy = new Histogram<>();
+        synchronized (source) {
+            for (Long bucket : source.values()) {
+                int count = source.get(bucket, 0);
+                if (count > 0) {
+                    copy.put(bucket, count);
+                }
+            }
+        }
+        return copy;
+    }
+
+    private Histogram<Long> diffHistogram(Histogram<Long> before, Histogram<Long> after) {
+        Histogram<Long> delta = new Histogram<>();
+        synchronized (after) {
+            for (Long bucket : after.values()) {
+                int afterCount = after.get(bucket, 0);
+                int beforeCount = before.get(bucket, 0);
+                int diff = afterCount - beforeCount;
+                if (diff > 0) {
+                    delta.put(bucket, diff);
+                }
+            }
+        }
+        return delta;
+    }
+
+    private ScheduledExecutorService startMonitor(int phaseNum, MetricsSnapshot initialBaseline) {
+        if (config.monitorIntervalSec <= 0) {
+            return null;
+        }
+        ScheduledExecutorService monitorExec = Executors.newSingleThreadScheduledExecutor();
+        AtomicReference<MetricsSnapshot> baselineRef = new AtomicReference<>(initialBaseline);
+        AtomicLong lastSampleNs = new AtomicLong(System.nanoTime());
+        monitorExec.scheduleAtFixedRate(() -> {
+            try {
+                MetricsSnapshot current = captureSnapshot();
+                MetricsSnapshot delta = computeDelta(baselineRef.get(), current);
+                long now = System.nanoTime();
+                double durationSeconds = (now - lastSampleNs.get()) / 1_000_000_000.0;
+                printResults("Monitor phase=" + (phaseNum + 1), durationSeconds, delta);
+                baselineRef.set(current);
+                lastSampleNs.set(now);
+            } catch (Exception e) {
+                LOG.warn("Error while sampling monitor metrics for phase {}", phaseNum + 1, e);
+            }
+        }, config.monitorIntervalSec, config.monitorIntervalSec, TimeUnit.SECONDS);
+        return monitorExec;
     }
 
     private void close() {
@@ -531,6 +688,7 @@ public class SmallBankClient2PC {
         config.numAccounts = xml.getInt("numAccounts", 100000);
         config.terminals = xml.getInt("terminals", 1);
         config.randomSeed = xml.getInt("randomSeed", 17);
+        config.monitorIntervalSec = xml.getInt("monitorInterval", 0);
 
         int size = xml.configurationsAt("/works/work").size();
         config.phases = new Phase[size];
@@ -565,6 +723,7 @@ public class SmallBankClient2PC {
         System.out.println("Configuration loaded:");
         System.out.printf("Accounts: %d%n", config.numAccounts);
         System.out.printf("Terminals: %d%n", config.terminals);
+        System.out.printf("Monitor interval: %d seconds%n", config.monitorIntervalSec);
         for (int i = 0; i < config.phases.length; i++) {
             if (config.phases[i].rate == 0.0) {
                 System.out.printf("Phase %d: duration=%ds, rate=SATURATE (rate=0), weights=%s%n",
@@ -668,7 +827,31 @@ public class SmallBankClient2PC {
         int numAccounts;
         int terminals;
         int randomSeed;
+        int monitorIntervalSec;
         Phase[] phases;
+    }
+
+    private static class MetricsSnapshot {
+        final long success;
+        final long aborted;
+        final long errors;
+        final long crossShard;
+        final long totalLatencyNs;
+        final Histogram<Long> latencyHistogram;
+
+        MetricsSnapshot() {
+            this(0, 0, 0, 0, 0, new Histogram<>());
+        }
+
+        MetricsSnapshot(long success, long aborted, long errors, long crossShard, long totalLatencyNs,
+                        Histogram<Long> latencyHistogram) {
+            this.success = success;
+            this.aborted = aborted;
+            this.errors = errors;
+            this.crossShard = crossShard;
+            this.totalLatencyNs = totalLatencyNs;
+            this.latencyHistogram = latencyHistogram;
+        }
     }
 
     private static class Phase {
