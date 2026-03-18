@@ -137,6 +137,12 @@ public class StandardStateManager extends StateManager {
         if (SVController.getStaticConf().isStateTransferEnabled() && dt.getRecoverer() != null) {
             StandardSMMessage stdMsg = (StandardSMMessage) msg;
             boolean sendState = stdMsg.getReplica() == SVController.getStaticConf().getProcessId();
+            logger.info("Received SM_REQUEST from replica {} for CID {} (requestedReplica={}, localReplica={}, sendState={})",
+                    msg.getSender(),
+                    msg.getCID(),
+                    stdMsg.getReplica(),
+                    SVController.getStaticConf().getProcessId(),
+                    sendState);
 
             ApplicationState thisState = dt.getRecoverer().getState(msg.getCID(), sendState);
             if (thisState == null) {
@@ -144,23 +150,59 @@ public class StandardStateManager extends StateManager {
                 logger.warn("For some reason, I am sending a void state");
                 thisState = dt.getRecoverer().getState(-1, sendState);
             }
+            int serializedBytes = (thisState != null && thisState.getSerializedState() != null)
+                    ? thisState.getSerializedState().length : -1;
+            logger.info("Preparing SM_REPLY to replica {} for CID {} (hasState={}, serializedBytes={}, lastCID={})",
+                    msg.getSender(),
+                    msg.getCID(),
+                    (thisState != null && thisState.hasState()),
+                    serializedBytes,
+                    (thisState != null ? thisState.getLastCID() : -1));
 
             int[] targets = {msg.getSender()};
             SMMessage smsg = new StandardSMMessage(SVController.getStaticConf().getProcessId(),
                     msg.getCID(), TOMUtil.SM_REPLY, -1, thisState, SVController.getCurrentView(),
                     tomLayer.getSynchronizer().getLCManager().getLastReg(), tomLayer.execManager.getCurrentLeader());
 
-            logger.info("Sending state...");
+            logger.info("Sending state reply to replica {} for CID {}", msg.getSender(), msg.getCID());
             tomLayer.getCommunication().send(targets, smsg);
-            logger.info("Sent");
+            logger.info("State reply sent to replica {} for CID {}", msg.getSender(), msg.getCID());
         }
     }
 
     @Override
     public void SMReplyDeliver(SMMessage msg, boolean isBFT) {
         lockTimer.lock();
-        if (SVController.getStaticConf().isStateTransferEnabled()) {
-            if (waitingCID != -1 && msg.getCID() == waitingCID) {
+        try {
+            if (SVController.getStaticConf().isStateTransferEnabled()) {
+                ApplicationState replyState = msg.getState();
+                int serializedBytes = (replyState != null && replyState.getSerializedState() != null)
+                        ? replyState.getSerializedState().length : -1;
+                logger.info(
+                        "Received SM_REPLY from replica {} for CID {} (waitingCID={}, appStateOnly={}, expectedReplica={}, hasState={}, serializedBytes={})",
+                        msg.getSender(),
+                        msg.getCID(),
+                        waitingCID,
+                        appStateOnly,
+                        replica,
+                        (replyState != null && replyState.hasState()),
+                        serializedBytes);
+
+                if (replyState == null) {
+                    logger.warn("Ignoring SM_REPLY from replica {} for CID {} because payload state is null",
+                            msg.getSender(),
+                            msg.getCID());
+                    return;
+                }
+
+                if (waitingCID == -1 || msg.getCID() != waitingCID) {
+                    logger.info("Ignoring SM_REPLY from replica {} for CID {} because waitingCID is {}",
+                            msg.getSender(),
+                            msg.getCID(),
+                            waitingCID);
+                    return;
+                }
+
                 int currentRegency = -1;
                 int currentLeader = -1;
                 View currentView = null;
@@ -170,7 +212,7 @@ public class StandardStateManager extends StateManager {
                     senderRegencies.put(msg.getSender(), msg.getRegency());
                     senderLeaders.put(msg.getSender(), msg.getLeader());
                     senderViews.put(msg.getSender(), msg.getView());
-                    senderProofs.put(msg.getSender(), msg.getState().getCertifiedDecision(SVController));
+                    senderProofs.put(msg.getSender(), replyState.getCertifiedDecision(SVController));
                     if (enoughRegencies(msg.getRegency())) {
                         currentRegency = msg.getRegency();
                     }
@@ -181,7 +223,7 @@ public class StandardStateManager extends StateManager {
                         currentView = msg.getView();
                     }
                     if (enoughProofs(waitingCID, this.tomLayer.getSynchronizer().getLCManager())) {
-                        currentProof = msg.getState().getCertifiedDecision(SVController);
+                        currentProof = replyState.getCertifiedDecision(SVController);
                     }
 
                 } else {
@@ -190,15 +232,24 @@ public class StandardStateManager extends StateManager {
                     currentView = SVController.getCurrentView();
                 }
 
-                if (msg.getSender() == replica && msg.getState().getSerializedState() != null) {
+                if (msg.getSender() == replica && replyState.getSerializedState() != null) {
                     logger.debug("Expected replica sent state. Setting it to state");
-                    state = msg.getState();
+                    state = replyState;
                     if (stateTimer != null) {
                         stateTimer.cancel();
                     }
+                } else if (msg.getSender() == replica) {
+                    logger.info("Expected replica {} replied for CID {} but serialized state is null",
+                            replica,
+                            waitingCID);
                 }
 
-                senderStates.put(msg.getSender(), msg.getState());
+                senderStates.put(msg.getSender(), replyState);
+                logger.info("Accepted SM_REPLY from replica {} for CID {} (collectedReplies={}, required>{})",
+                        msg.getSender(),
+                        waitingCID,
+                        getReplies(),
+                        SVController.getCurrentViewF());
 
                 logger.debug("Verifying more than F replies");
                 if (enoughReplies()) {
@@ -218,11 +269,25 @@ public class StandardStateManager extends StateManager {
                         TreeMap<Integer, TOMMessage> lastReplies = ((DefaultApplicationState) state).getLastReplies();
                         logger.debug("DefaultApplicationState lastReplies TreeMap :: size=" + lastReplies.size());
                     }
+                    logger.info(
+                            "State transfer gates for CID {}: haveState={}, otherReplicaStatePresent={}, currentRegency={}, currentLeader={}, currentViewPresent={}, proofPresent={}, appStateOnly={}, replies={}",
+                            waitingCID,
+                            haveState,
+                            (otherReplicaState != null),
+                            currentRegency,
+                            currentLeader,
+                            (currentView != null),
+                            (currentProof != null),
+                            appStateOnly,
+                            getReplies());
 
                     if (otherReplicaState != null && haveState == 1 && currentRegency > -1
                             && currentLeader > -1 && currentView != null && (!isBFT || currentProof != null || appStateOnly)) {
 
-                        logger.info("Received state. Will install it");
+                        logger.info("Received state. Will install it (CID {}, expectedReplica {}, stateLastCID {})",
+                                waitingCID,
+                                replica,
+                                state.getLastCID());
 
                         tomLayer.getSynchronizer().getLCManager().setLastReg(currentRegency);
                         tomLayer.getSynchronizer().getLCManager().setNextReg(currentRegency);
@@ -279,11 +344,15 @@ public class StandardStateManager extends StateManager {
                         //if (currentRegency > 0)
                         //    tomLayer.requestsTimer.setTimeout(tomLayer.requestsTimer.getTimeout() * (currentRegency * 2));
 
+                        logger.info("Pausing decision delivery before applying transferred state for CID {}", waitingCID);
                         dt.pauseDecisionDelivery();
                         waitingCID = -1;
+                        logger.info("Invoking DeliveryThread.update with transferred state (lastCID={})", state.getLastCID());
                         dt.update(state);
+                        logger.info("DeliveryThread.update completed (lastCID={})", state.getLastCID());
 
                         if (!appStateOnly && execManager.stopped()) {
+                            logger.info("Execution manager is stopped; reinserting stopped messages after state install");
                             Queue<ConsensusMessage> stoppedMsgs = execManager.getStoppedMsgs();
                             for (ConsensusMessage stopped : stoppedMsgs) {
                                 if (stopped.getNumber() > state.getLastCID() /*msg.getCID()*/) {
@@ -294,6 +363,7 @@ public class StandardStateManager extends StateManager {
                             execManager.restart();
                         }
 
+                        logger.info("Processing out-of-context messages after state install");
                         tomLayer.processOutOfContext();
 
                         if (SVController.getCurrentViewId() != currentView.getId()) {
@@ -303,6 +373,7 @@ public class StandardStateManager extends StateManager {
 
                         isInitializing = false;
 
+                        logger.info("Resuming decision delivery after state install");
                         dt.canDeliver();
                         dt.resumeDecisionDelivery();
 
@@ -318,9 +389,16 @@ public class StandardStateManager extends StateManager {
 
                         if (appStateOnly) {
                             appStateOnly = false;
+                            logger.info("Resuming leader-change protocol after app-state-only transfer");
                             tomLayer.getSynchronizer().resumeLC();
                         }
                     } else if (otherReplicaState == null && (SVController.getCurrentViewN() / 2) < getReplies()) {
+                        logger.info(
+                                "State transfer branch (CID {}): missing comparison state despite replies={} (> N/2={}), resetting and{}",
+                                waitingCID,
+                                getReplies(),
+                                (SVController.getCurrentViewN() / 2),
+                                (appStateOnly ? " re-requesting app state" : " waiting for next trigger"));
                         waitingCID = -1;
                         reset();
 
@@ -332,7 +410,10 @@ public class StandardStateManager extends StateManager {
                             requestState();
                         }
                     } else if (haveState == -1) {
-                        logger.debug("The replica from which I expected the state, sent one which doesn't match the hash of the others, or it never sent it at all");
+                        logger.info(
+                                "State transfer branch (CID {}): expected replica {} state mismatched quorum hash or was missing; rotating expected replica and retrying",
+                                waitingCID,
+                                replica);
 
                         changeReplica();
                         reset();
@@ -343,7 +424,11 @@ public class StandardStateManager extends StateManager {
                         }
                     } else if (haveState == 0 && (SVController.getCurrentViewN() - SVController.getCurrentViewF()) <= getReplies()) {
 
-                        logger.debug("Could not obtain the state, retrying");
+                        logger.info(
+                                "State transfer branch (CID {}): could not obtain installable state with replies={} (needed>={}); clearing waitingCID",
+                                waitingCID,
+                                getReplies(),
+                                (SVController.getCurrentViewN() - SVController.getCurrentViewF()));
                         reset();
                         if (stateTimer != null) {
                             stateTimer.cancel();
@@ -351,13 +436,24 @@ public class StandardStateManager extends StateManager {
                         waitingCID = -1;
                         //requestState();
                     } else {
-                        logger.debug("State transfer not yet finished");
+                        logger.info("State transfer not yet finished for CID {} (haveState={}, otherReplicaStatePresent={}, replies={}, required>{})",
+                                waitingCID,
+                                haveState,
+                                (otherReplicaState != null),
+                                getReplies(),
+                                SVController.getCurrentViewF());
 
                     }
+                } else {
+                    logger.info("State transfer waiting for more replies for CID {} (replies={}, required>{})",
+                            waitingCID,
+                            getReplies(),
+                            SVController.getCurrentViewF());
                 }
             }
+        } finally {
+            lockTimer.unlock();
         }
-        lockTimer.unlock();
     }
 
     /**

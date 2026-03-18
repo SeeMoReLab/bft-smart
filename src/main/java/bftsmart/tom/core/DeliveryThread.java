@@ -195,8 +195,12 @@ public final class DeliveryThread extends Thread {
 	}
 
 	public void update(ApplicationState state) {
-
+		logger.info("DeliveryThread.update invoked (stateType={}, stateLastCID={})",
+				(state == null ? "null" : state.getClass().getName()),
+				(state == null ? -1 : state.getLastCID()));
+		logger.info("Calling recoverer.setState(...)");
 		int lastCID = recoverer.setState(state);
+		logger.info("recoverer.setState(...) returned lastCID={}", lastCID);
 
 		// set this decision as the last one from this replica
 		logger.info("Setting last CID to " + lastCID);

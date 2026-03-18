@@ -18,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -48,10 +49,12 @@ public final class FailureInjectionController {
     private static final String TAG_TIME = "time";
     private static final String TAG_WARM_UP_TIME = "warmUpTime";
     private static final String TAG_WARM_UP_TIME_MS = "warmUpTimeMs";
-    private static final String TAG_LEADER_FAILURE_INTERVAL = "leaderFailureInterval";
-    private static final String TAG_LEADER_FAILURE_INTERVAL_MS = "leaderFailureIntervalMs";
+    private static final String ID_TOKEN_LEADER = "leader";
 
     private static final AtomicInteger lastLoggedPhase = new AtomicInteger(Integer.MIN_VALUE);
+    private static final Object leaderWindowResolutionLock = new Object();
+    private static volatile int lastResolvedLeaderWindowPhase = Integer.MIN_VALUE;
+    private static volatile Map<Integer, Integer> lastResolvedLeaderWindowReplicaDelayMs = Collections.emptyMap();
     private static volatile Config config = Config.disabled();
 
     private FailureInjectionController() {
@@ -80,22 +83,51 @@ public final class FailureInjectionController {
         }
 
         long warmUpMs = readWarmUpMs(root);
-        long leaderFailureIntervalMs = readLeaderFailureIntervalMs(root);
         List<PhaseRule> phases = parsePhases(root);
 
-        config = new Config(true, path.toAbsolutePath().toString(), startUnixMs, warmUpMs, leaderFailureIntervalMs, phases);
+        config = new Config(true, path.toAbsolutePath().toString(), startUnixMs, warmUpMs, phases);
         lastLoggedPhase.set(Integer.MIN_VALUE);
+        synchronized (leaderWindowResolutionLock) {
+            lastResolvedLeaderWindowPhase = Integer.MIN_VALUE;
+            lastResolvedLeaderWindowReplicaDelayMs = Collections.emptyMap();
+        }
 
-        logger.info("Failure injection enabled: spec={}, startUnixMs={}, warmUpMs={}, leaderFailureIntervalMs={}, phaseCount={}",
-                config.specPath, config.startUnixMs, config.warmUpMs, config.leaderFailureIntervalMs, config.phases.size());
+        logger.info("Failure injection enabled: spec={}, startUnixMs={}, warmUpMs={}, phaseCount={}",
+                config.specPath, config.startUnixMs, config.warmUpMs, config.phases.size());
     }
 
     public static void disable() {
         config = Config.disabled();
         lastLoggedPhase.set(Integer.MIN_VALUE);
+        synchronized (leaderWindowResolutionLock) {
+            lastResolvedLeaderWindowPhase = Integer.MIN_VALUE;
+            lastResolvedLeaderWindowReplicaDelayMs = Collections.emptyMap();
+        }
     }
 
     public static int getProposalDelayMs(int replicaId) {
+        return getProposalDelayMs(replicaId, replicaId, null, 0);
+    }
+
+    public static void observeReplicaState(int currentLeaderId, int[] currentViewProcesses, int f) {
+        Config snapshot = config;
+        if (!snapshot.enabled) {
+            return;
+        }
+
+        long elapsedSinceStartMs = System.currentTimeMillis() - snapshot.startUnixMs;
+        long elapsedSinceWarmUpMs = elapsedSinceStartMs - snapshot.warmUpMs;
+        int activePhaseIndex = findActivePhase(snapshot.phases, elapsedSinceWarmUpMs);
+        logPhaseChange(snapshot, activePhaseIndex, elapsedSinceStartMs, elapsedSinceWarmUpMs);
+
+        if (activePhaseIndex < 0) {
+            return;
+        }
+
+        resolveLeaderWindowDelaysIfNeeded(snapshot, activePhaseIndex, currentLeaderId, currentViewProcesses, f);
+    }
+
+    public static int getProposalDelayMs(int replicaId, int currentLeaderId, int[] currentViewProcesses, int f) {
         Config snapshot = config;
         if (!snapshot.enabled) {
             return 0;
@@ -110,29 +142,26 @@ public final class FailureInjectionController {
             return 0;
         }
 
-        Integer delayMs = snapshot.phases.get(activePhaseIndex).replicaProposalDelayMs.get(replicaId);
-        return delayMs == null ? 0 : delayMs;
-    }
+        PhaseRule phaseRule = snapshot.phases.get(activePhaseIndex);
 
-    public static long getLeaderFailureIntervalMs() {
-        Config snapshot = config;
-        if (!snapshot.enabled) {
-            return 0L;
+        Integer explicitDelayMs = phaseRule.proposalDelayRule.replicaProposalDelayMs.get(replicaId);
+        if (explicitDelayMs != null) {
+            return explicitDelayMs;
         }
-        return snapshot.leaderFailureIntervalMs;
-    }
 
-    public static long getLeaderFailureStartUnixMs() {
-        Config snapshot = config;
-        if (!snapshot.enabled) {
-            return -1L;
+        if (phaseRule.proposalDelayRule.leaderWindowDelayMs == null) {
+            return 0;
         }
-        return safeAdd(snapshot.startUnixMs, snapshot.warmUpMs);
-    }
 
-    public static boolean isLeaderFailureEnabled() {
-        Config snapshot = config;
-        return snapshot.enabled && snapshot.leaderFailureIntervalMs > 0;
+        Map<Integer, Integer> leaderWindowDelays = resolveLeaderWindowDelaysIfNeeded(
+                snapshot,
+                activePhaseIndex,
+                currentLeaderId,
+                currentViewProcesses,
+                f
+        );
+        Integer leaderWindowDelayMs = leaderWindowDelays.get(replicaId);
+        return leaderWindowDelayMs == null ? 0 : leaderWindowDelayMs;
     }
 
     private static int findActivePhase(List<PhaseRule> phases, long elapsedMs) {
@@ -184,8 +213,8 @@ public final class FailureInjectionController {
         int order = 0;
         for (Element phaseElement : phaseElements) {
             long startOffsetMs = readPhaseStartOffsetMs(phaseElement);
-            Map<Integer, Integer> replicaDelays = readReplicaDelays(phaseElement);
-            phaseRules.add(new PhaseRule(startOffsetMs, replicaDelays, order));
+            ProposalDelayRule proposalDelayRule = readProposalDelayRule(phaseElement);
+            phaseRules.add(new PhaseRule(startOffsetMs, proposalDelayRule, order));
             order++;
         }
 
@@ -202,18 +231,6 @@ public final class FailureInjectionController {
             return Math.max(0L, explicitMs);
         }
         Double seconds = readDoubleTag(root, TAG_WARM_UP_TIME);
-        if (seconds == null) {
-            return 0L;
-        }
-        return Math.max(0L, Math.round(seconds * 1000.0d));
-    }
-
-    private static long readLeaderFailureIntervalMs(Element root) {
-        Long explicitMs = readLongTag(root, TAG_LEADER_FAILURE_INTERVAL_MS);
-        if (explicitMs != null) {
-            return Math.max(0L, explicitMs);
-        }
-        Double seconds = readDoubleTag(root, TAG_LEADER_FAILURE_INTERVAL);
         if (seconds == null) {
             return 0L;
         }
@@ -245,29 +262,30 @@ public final class FailureInjectionController {
         return Math.max(0L, convertedMs);
     }
 
-    private static Map<Integer, Integer> readReplicaDelays(Element phaseElement) {
+    private static ProposalDelayRule readProposalDelayRule(Element phaseElement) {
         Element pbft = findDirectChild(phaseElement, TAG_PBFT);
         if (pbft == null) {
-            return Collections.emptyMap();
+            return ProposalDelayRule.empty();
         }
 
         Element proposalDelay = findDirectChild(pbft, TAG_PROPOSAL_DELAY);
         if (proposalDelay == null) {
-            return Collections.emptyMap();
+            return ProposalDelayRule.empty();
         }
 
         Integer defaultDelayMs = readIntegerTag(proposalDelay, TAG_DELAY_MS);
         Element replicas = findDirectChild(proposalDelay, TAG_REPLICAS);
         if (replicas == null) {
-            return Collections.emptyMap();
+            return ProposalDelayRule.empty();
         }
 
         Map<Integer, Integer> result = new HashMap<>();
+        Integer leaderWindowDelayMs = null;
         List<Element> replicaEntries = findDirectChildren(replicas, TAG_REPLICA);
         for (Element replicaEntry : replicaEntries) {
-            Integer replicaId = readIntegerTag(replicaEntry, TAG_ID);
+            String replicaIdText = readTagText(replicaEntry, TAG_ID);
             Integer replicaDelayMs = readIntegerTag(replicaEntry, TAG_DELAY_MS);
-            if (replicaId == null) {
+            if (replicaIdText == null) {
                 continue;
             }
             if (replicaDelayMs == null) {
@@ -276,26 +294,135 @@ public final class FailureInjectionController {
             if (replicaDelayMs == null) {
                 continue;
             }
-            result.put(replicaId, Math.max(0, replicaDelayMs));
+            int sanitizedDelayMs = Math.max(0, replicaDelayMs);
+            if (isLeaderToken(replicaIdText)) {
+                leaderWindowDelayMs = sanitizedDelayMs;
+                continue;
+            }
+            Integer replicaId = parseInteger(replicaIdText);
+            if (replicaId == null) {
+                continue;
+            }
+            result.put(replicaId, sanitizedDelayMs);
         }
 
         if (!replicaEntries.isEmpty()) {
-            return Collections.unmodifiableMap(result);
+            if (result.isEmpty() && leaderWindowDelayMs == null) {
+                return ProposalDelayRule.empty();
+            }
+            return new ProposalDelayRule(Collections.unmodifiableMap(result), leaderWindowDelayMs);
         }
 
         if (defaultDelayMs == null) {
-            return Collections.emptyMap();
+            return ProposalDelayRule.empty();
         }
 
+        int sanitizedDefaultDelayMs = Math.max(0, defaultDelayMs);
         List<Element> replicaIds = findDirectChildren(replicas, TAG_ID);
         for (Element replicaIdElement : replicaIds) {
-            Integer replicaId = parseInteger(replicaIdElement.getTextContent());
+            String replicaIdText = replicaIdElement.getTextContent();
+            if (replicaIdText == null) {
+                continue;
+            }
+            replicaIdText = replicaIdText.trim();
+            if (replicaIdText.isEmpty()) {
+                continue;
+            }
+            if (isLeaderToken(replicaIdText)) {
+                leaderWindowDelayMs = sanitizedDefaultDelayMs;
+                continue;
+            }
+            Integer replicaId = parseInteger(replicaIdText);
             if (replicaId != null) {
-                result.put(replicaId, Math.max(0, defaultDelayMs));
+                result.put(replicaId, sanitizedDefaultDelayMs);
             }
         }
 
-        return Collections.unmodifiableMap(result);
+        if (result.isEmpty() && leaderWindowDelayMs == null) {
+            return ProposalDelayRule.empty();
+        }
+        return new ProposalDelayRule(Collections.unmodifiableMap(result), leaderWindowDelayMs);
+    }
+
+    private static boolean isLeaderToken(String replicaIdText) {
+        return ID_TOKEN_LEADER.equalsIgnoreCase(replicaIdText);
+    }
+
+    private static Map<Integer, Integer> resolveLeaderWindowDelaysIfNeeded(
+            Config snapshot,
+            int activePhaseIndex,
+            int currentLeaderId,
+            int[] currentViewProcesses,
+            int f
+    ) {
+        if (lastResolvedLeaderWindowPhase == activePhaseIndex) {
+            return lastResolvedLeaderWindowReplicaDelayMs;
+        }
+        synchronized (leaderWindowResolutionLock) {
+            if (lastResolvedLeaderWindowPhase == activePhaseIndex) {
+                return lastResolvedLeaderWindowReplicaDelayMs;
+            }
+
+            Map<Integer, Integer> resolvedDelays = Collections.emptyMap();
+            if (activePhaseIndex >= 0 && activePhaseIndex < snapshot.phases.size()) {
+                PhaseRule phaseRule = snapshot.phases.get(activePhaseIndex);
+                resolvedDelays = resolveLeaderWindowDelays(phaseRule, currentLeaderId, currentViewProcesses, f);
+            }
+
+            lastResolvedLeaderWindowReplicaDelayMs = resolvedDelays;
+            lastResolvedLeaderWindowPhase = activePhaseIndex;
+            return lastResolvedLeaderWindowReplicaDelayMs;
+        }
+    }
+
+    private static Map<Integer, Integer> resolveLeaderWindowDelays(
+            PhaseRule phaseRule,
+            int currentLeaderId,
+            int[] currentViewProcesses,
+            int f
+    ) {
+        Integer delayMs = phaseRule.proposalDelayRule.leaderWindowDelayMs;
+        if (delayMs == null) {
+            return Collections.emptyMap();
+        }
+        if (currentViewProcesses == null || currentViewProcesses.length == 0) {
+            logger.warn("Cannot resolve phase-start leader delay window for phase {}: current view is empty",
+                    phaseRule.originalOrder);
+            return Collections.emptyMap();
+        }
+
+        int[] orderedProcesses = Arrays.copyOf(currentViewProcesses, currentViewProcesses.length);
+        Arrays.sort(orderedProcesses);
+
+        int leaderPos = -1;
+        for (int i = 0; i < orderedProcesses.length; i++) {
+            if (orderedProcesses[i] == currentLeaderId) {
+                leaderPos = i;
+                break;
+            }
+        }
+        if (leaderPos < 0) {
+            logger.warn("Cannot resolve phase-start leader delay window for phase {}: leader {} not in current view {}",
+                    phaseRule.originalOrder, currentLeaderId, Arrays.toString(orderedProcesses));
+            return Collections.emptyMap();
+        }
+
+        int windowSize = Math.max(0, Math.min(f, orderedProcesses.length));
+        if (windowSize == 0) {
+            return Collections.emptyMap();
+        }
+
+        Map<Integer, Integer> resolved = new HashMap<>();
+        List<Integer> targets = new ArrayList<>(windowSize);
+        for (int offset = 0; offset < windowSize; offset++) {
+            int replicaId = orderedProcesses[(leaderPos + offset) % orderedProcesses.length];
+            resolved.put(replicaId, delayMs);
+            targets.add(replicaId);
+        }
+        Collections.sort(targets);
+        logger.info("Resolved phase-start leader proposal delay window: phase={}, leader={}, f={}, delayMs={}, targets={}",
+                phaseRule.originalOrder, currentLeaderId, f, delayMs, targets);
+        return Collections.unmodifiableMap(resolved);
     }
 
     private static Document parseDocument(File specFile) {
@@ -411,45 +538,50 @@ public final class FailureInjectionController {
         }
     }
 
-    private static long safeAdd(long left, long right) {
-        if (Long.MAX_VALUE - left < right) {
-            return Long.MAX_VALUE;
-        }
-        return left + right;
-    }
-
     private static final class Config {
         final boolean enabled;
         final String specPath;
         final long startUnixMs;
         final long warmUpMs;
-        final long leaderFailureIntervalMs;
         final List<PhaseRule> phases;
 
         private Config(boolean enabled, String specPath, long startUnixMs, long warmUpMs,
-                       long leaderFailureIntervalMs, List<PhaseRule> phases) {
+                       List<PhaseRule> phases) {
             this.enabled = enabled;
             this.specPath = specPath;
             this.startUnixMs = startUnixMs;
             this.warmUpMs = warmUpMs;
-            this.leaderFailureIntervalMs = leaderFailureIntervalMs;
             this.phases = phases;
         }
 
         static Config disabled() {
-            return new Config(false, null, 0L, 0L, 0L, Collections.<PhaseRule>emptyList());
+            return new Config(false, null, 0L, 0L, Collections.<PhaseRule>emptyList());
         }
     }
 
     private static final class PhaseRule {
         final long startOffsetMs;
-        final Map<Integer, Integer> replicaProposalDelayMs;
+        final ProposalDelayRule proposalDelayRule;
         final int originalOrder;
 
-        private PhaseRule(long startOffsetMs, Map<Integer, Integer> replicaProposalDelayMs, int originalOrder) {
+        private PhaseRule(long startOffsetMs, ProposalDelayRule proposalDelayRule, int originalOrder) {
             this.startOffsetMs = startOffsetMs;
-            this.replicaProposalDelayMs = replicaProposalDelayMs;
+            this.proposalDelayRule = proposalDelayRule;
             this.originalOrder = originalOrder;
+        }
+    }
+
+    private static final class ProposalDelayRule {
+        final Map<Integer, Integer> replicaProposalDelayMs;
+        final Integer leaderWindowDelayMs;
+
+        private ProposalDelayRule(Map<Integer, Integer> replicaProposalDelayMs, Integer leaderWindowDelayMs) {
+            this.replicaProposalDelayMs = replicaProposalDelayMs;
+            this.leaderWindowDelayMs = leaderWindowDelayMs;
+        }
+
+        static ProposalDelayRule empty() {
+            return new ProposalDelayRule(Collections.<Integer, Integer>emptyMap(), null);
         }
     }
 }

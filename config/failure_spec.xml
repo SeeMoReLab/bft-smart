@@ -17,8 +17,6 @@
     <replicaIdType>global</replicaIdType>
     <!-- Warm-up period in seconds: no failure behavior is active during this time. -->
     <warmUpTime>10</warmUpTime>
-    <!-- Force leader failure / view-change interval in seconds, starting after warm-up. -->
-    <leaderFailureInterval>30</leaderFailureInterval>
 
     <phases>
         <phase>
@@ -62,13 +60,16 @@
             <pbft>
                 <!--
                   Proposal-delay behavior:
-                    enabled only for listed replica IDs.
+                    enabled for listed replica IDs.
+                    Special ID "leader" means:
+                    snapshot phase-start leader and target leader + next (f-1) replicas
+                    in current view order for the whole phase.
                 -->
                 <proposalDelay>
                     <replicas>
 
                         <replica>
-                            <id>0</id>
+                            <id>leader</id>
                             <delayMs>200</delayMs>
                         </replica>
 

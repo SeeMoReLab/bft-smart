@@ -292,6 +292,8 @@ public abstract class DefaultRecoverable implements Recoverable, BatchExecutable
     @Override
     public int setState(ApplicationState recvState) {
 
+        logger.info("setState invoked with ApplicationState type {}",
+                (recvState == null ? "null" : recvState.getClass().getName()));
         int lastCID = -1;
         if (recvState instanceof DefaultApplicationState) {
 
@@ -299,16 +301,28 @@ public abstract class DefaultRecoverable implements Recoverable, BatchExecutable
 
             int lastCheckpointCID = state.getLastCheckpointCID();
             lastCID = state.getLastCID();
+            CommandsInfo[] receivedBatches = state.getMessageBatches();
+            int receivedBatchCount = (receivedBatches == null ? 0 : receivedBatches.length);
+            int serializedStateBytes = (state.getSerializedState() != null ? state.getSerializedState().length : -1);
+            logger.info("Received state metadata: lastCheckpointCID={}, lastCID={}, serializedStateBytes={}, messageBatchCount={}",
+                    lastCheckpointCID,
+                    lastCID,
+                    serializedStateBytes,
+                    receivedBatchCount);
 
             logger.info("I'm going to update myself from CID "
                     + lastCheckpointCID + " to CID " + lastCID);
            
+            logger.info("Acquiring state lock to apply received state");
             stateLock.lock();
             if (state.getSerializedState() != null) {
                 logger.info("The state is not null. Will install it");
+                logger.info("Installing snapshot and updating state log (snapshotBytes={})",
+                        state.getSerializedState().length);
                 initLog();
                 log.update(state);
                 installSnapshot(state.getSerializedState());
+                logger.info("Snapshot installation completed");
 
                 // Sets the reply store
                 if (controller.getStaticConf().useReadOnlyRequests()) {
@@ -322,8 +336,15 @@ public abstract class DefaultRecoverable implements Recoverable, BatchExecutable
                         logger.warn("(DefaultRecoverable.setState): client manager is null, cannot set last replies of clients");
                     }
                 }
+            } else {
+                logger.warn("Received state has null serialized snapshot for lastCID={}", lastCID);
             }
 
+            logger.info("Starting ordered batch replay from CID {} to CID {}",
+                    (lastCheckpointCID + 1),
+                    lastCID);
+            int replayedConsensus = 0;
+            int skippedConsensus = 0;
             for (int cid = lastCheckpointCID + 1; cid <= lastCID; cid++) {
                 try {
 
@@ -337,12 +358,20 @@ public abstract class DefaultRecoverable implements Recoverable, BatchExecutable
                     MessageContext[] msgCtx = cmdInfo.msgCtx;
                     
                     if (commands == null || msgCtx == null || msgCtx[0].isNoOp()) {
+                        skippedConsensus++;
                         continue;
                     }                        
+                    replayedConsensus++;
                     appExecuteBatch(commands, msgCtx, false);
+                    if (replayedConsensus % 100 == 0 || cid == lastCID) {
+                        logger.info("Replay progress: replayed={}, skipped={}, currentCID={}",
+                                replayedConsensus,
+                                skippedConsensus,
+                                cid);
+                    }
                     
                 } catch (Exception e) {
-                    logger.error("Failed to process and verify batched requests",e);
+                    logger.error("Failed to process and verify batched requests for cid " + cid, e);
                     if (e instanceof ArrayIndexOutOfBoundsException) {
                         logger.info("Last checkpoint, last consensus ID (CID): " + state.getLastCheckpointCID());
                         logger.info("Last CID: " + state.getLastCID());
@@ -352,7 +381,15 @@ public abstract class DefaultRecoverable implements Recoverable, BatchExecutable
                 }
 
             }
+            logger.info("Finished state replay: replayed={}, skipped={}, lastCID={}",
+                    replayedConsensus,
+                    skippedConsensus,
+                    lastCID);
             stateLock.unlock();
+            logger.info("Released state lock after applying received state");
+        } else {
+            logger.warn("setState received unsupported ApplicationState implementation: {}",
+                    (recvState == null ? "null" : recvState.getClass().getName()));
 
         }
         

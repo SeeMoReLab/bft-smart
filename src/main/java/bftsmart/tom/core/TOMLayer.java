@@ -30,7 +30,6 @@ import bftsmart.tom.ServiceReplica;
 import bftsmart.tom.core.messages.ForwardedMessage;
 import bftsmart.tom.core.messages.TOMMessage;
 import bftsmart.tom.core.messages.TOMMessageType;
-import bftsmart.tom.leaderchange.LCMessage;
 import bftsmart.tom.leaderchange.RequestsTimer;
 import bftsmart.tom.server.Recoverable;
 import bftsmart.tom.server.RequestVerifier;
@@ -52,8 +51,6 @@ import java.util.TimerTask;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -117,7 +114,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
     public ServerViewController controller;
 
     private final Synchronizer syncher;
-    private ScheduledExecutorService periodicLeaderFailureExecutor;
 
     private ShardHandler shardHandler = null;
 
@@ -235,7 +231,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
 
 
         this.syncher = new Synchronizer(this); // create synchronizer
-        schedulePeriodicLeaderFailureIfConfigured();
 
         if (controller.getStaticConf().getBatchTimeout() > -1) {
 
@@ -255,62 +250,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
 
             }, 0, controller.getStaticConf().getBatchTimeout());
         }
-    }
-
-    private void schedulePeriodicLeaderFailureIfConfigured() {
-        if (requestsTimer == null || !FailureInjectionController.isLeaderFailureEnabled()) {
-            return;
-        }
-
-        long intervalMs = FailureInjectionController.getLeaderFailureIntervalMs();
-        long startAfterWarmUpUnixMs = FailureInjectionController.getLeaderFailureStartUnixMs();
-        if (intervalMs <= 0 || startAfterWarmUpUnixMs < 0) {
-            return;
-        }
-
-        long initialDelayMs = computeInitialPeriodicDelayMs(System.currentTimeMillis(), startAfterWarmUpUnixMs, intervalMs);
-        periodicLeaderFailureExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "periodic-leader-failure");
-            thread.setDaemon(true);
-            return thread;
-        });
-
-        periodicLeaderFailureExecutor.scheduleAtFixedRate(() -> {
-            if (!doWork || isChangingLeader()) {
-                return;
-            }
-            try {
-                logger.info("Triggering periodic leader-change due to failure injection schedule");
-                int[] myself = new int[]{controller.getStaticConf().getProcessId()};
-                communication.send(myself, new LCMessage(-1, TOMUtil.FORCE_LC_LOCALLY, -1, null));
-            } catch (Exception exception) {
-                logger.error("Error while triggering periodic leader-change", exception);
-            }
-        }, initialDelayMs, intervalMs, TimeUnit.MILLISECONDS);
-
-        logger.info("Periodic leader-change scheduler enabled: startAfterWarmUpUnixMs={}, intervalMs={}, initialDelayMs={}",
-                startAfterWarmUpUnixMs, intervalMs, initialDelayMs);
-    }
-
-    private long computeInitialPeriodicDelayMs(long nowMs, long startAfterWarmUpUnixMs, long intervalMs) {
-        if (nowMs < startAfterWarmUpUnixMs) {
-            long untilWarmUpEnds = startAfterWarmUpUnixMs - nowMs;
-            return safeAdd(untilWarmUpEnds, intervalMs);
-        }
-
-        long elapsedSinceWarmUpMs = nowMs - startAfterWarmUpUnixMs;
-        long remainder = elapsedSinceWarmUpMs % intervalMs;
-        if (remainder == 0) {
-            return intervalMs;
-        }
-        return intervalMs - remainder;
-    }
-
-    private long safeAdd(long left, long right) {
-        if (Long.MAX_VALUE - left < right) {
-            return Long.MAX_VALUE;
-        }
-        return left + right;
     }
 
     /**
@@ -437,6 +376,13 @@ public final class TOMLayer extends Thread implements RequestReceiver {
     public void requestReceived(TOMMessage msg, boolean fromClient) {
 
         if (!doWork) return;
+
+        FailureInjectionController.observeReplicaState(
+                execManager.getCurrentLeader(),
+                controller.getCurrentViewProcesses(),
+                controller.getCurrentViewF()
+        );
+
         switch(msg.getReqType()) {
 		case ASK_STATUS:
 		case REPLY:
@@ -778,7 +724,6 @@ public final class TOMLayer extends Thread implements RequestReceiver {
         setNoExec();
 
         if (this.requestsTimer != null) this.requestsTimer.shutdown();
-        if (this.periodicLeaderFailureExecutor != null) this.periodicLeaderFailureExecutor.shutdownNow();
         if (this.clientsManager != null) {
             this.clientsManager.clear();
             this.clientsManager.getPendingRequests().clear();

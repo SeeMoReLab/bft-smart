@@ -52,8 +52,13 @@ public class Proposer {
      * @param value Value to be proposed
      */
     public void startConsensus(int cid, byte[] value) {
-        int proposalDelayMs = FailureInjectionController
-                .getProposalDelayMs(this.controller.getStaticConf().getProcessId());
+        int replicaId = this.controller.getStaticConf().getProcessId();
+        int proposalDelayMs = FailureInjectionController.getProposalDelayMs(
+                replicaId,
+                replicaId,
+                this.controller.getCurrentViewProcesses(),
+                this.controller.getCurrentViewF()
+        );
         if (proposalDelayMs > 0) {
             try {
                 Thread.sleep(proposalDelayMs);
