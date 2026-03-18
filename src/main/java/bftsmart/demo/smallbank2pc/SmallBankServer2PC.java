@@ -55,9 +55,9 @@ public class SmallBankServer2PC extends DefaultRecoverable {
     private static final int POLL_INTERVAL_MS = 50;
 
     // Account data
-    private HashMap<Long, String> accounts;
-    private HashMap<Long, Double> checking;
-    private HashMap<Long, Double> savings;
+    private TreeMap<Long, String> accounts;
+    private TreeMap<Long, Double> checking;
+    private TreeMap<Long, Double> savings;
 
     // 2PC state management
     private final Map<String, PendingTransaction> pendingTransactions = new ConcurrentHashMap<>();
@@ -304,9 +304,9 @@ public class SmallBankServer2PC extends DefaultRecoverable {
         this.myReplicaId = replicaId;
         this.totalShards = totalShards;
         this.learning = learning;
-        this.accounts = new HashMap<>();
-        this.checking = new HashMap<>();
-        this.savings = new HashMap<>();
+        this.accounts = new TreeMap<>();
+        this.checking = new TreeMap<>();
+        this.savings = new TreeMap<>();
         this.learningMetrics = new TimeoutLearningWindowMetrics(MAX_REPORT_LENGTH * 2);
 
         if (configHome != null) {
@@ -531,9 +531,9 @@ public class SmallBankServer2PC extends DefaultRecoverable {
             Map<Long, String> snapshotAccounts = (Map<Long, String>) in.readObject();
             Map<Long, Double> snapshotChecking = (Map<Long, Double>) in.readObject();
             Map<Long, Double> snapshotSavings = (Map<Long, Double>) in.readObject();
-            accounts = new HashMap<>(snapshotAccounts);
-            checking = new HashMap<>(snapshotChecking);
-            savings = new HashMap<>(snapshotSavings);
+            accounts = new TreeMap<>(snapshotAccounts);
+            checking = new TreeMap<>(snapshotChecking);
+            savings = new TreeMap<>(snapshotSavings);
             try {
                 iterations = in.readLong();
             } catch (EOFException e) {
