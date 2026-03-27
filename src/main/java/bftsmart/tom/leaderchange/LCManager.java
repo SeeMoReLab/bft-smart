@@ -230,6 +230,18 @@ public class LCManager {
     }
 
     /**
+     * Checks whether a STOP from the same sender/regency pair was already recorded.
+     *
+     * @param regency the STOP regency
+     * @param pid sender id
+     * @return true if this STOP sender was already observed for that regency
+     */
+    public boolean hasStopFrom(int regency, int pid) {
+        HashSet<Integer> pids = stops.get(regency);
+        return pids != null && pids.contains(pid);
+    }
+
+    /**
      * Discard information about STOP messages up to specified regency
      * @param ts timestamp up to which to discard messages
      */

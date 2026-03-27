@@ -830,6 +830,12 @@ public class Synchronizer {
 
                     logger.debug("Received regency change request");
 
+                    if (lcManager.hasStopFrom(msg.getReg(), msg.getSender())) {
+                        logger.debug("Ignoring duplicate STOP message for regency {} from replica {}",
+                                msg.getReg(), msg.getSender());
+                        break;
+                    }
+
                     TOMMessage[] requests = deserializeTOMMessages(msg.getPayload());
 
                     // store requests that came with the STOP message
@@ -846,6 +852,12 @@ public class Synchronizer {
 
                 } else if (msg.getReg() > lcManager.getLastReg()) { // send STOP to out of context if
                                                                     // it is for a future regency
+                    if (lcManager.hasStopFrom(msg.getReg(), msg.getSender())) {
+                        logger.debug("Ignoring duplicate out-of-context STOP message for regency {} from replica {}",
+                                msg.getReg(), msg.getSender());
+                        break;
+                    }
+
                     logger.debug("Keeping STOP message as out of context for regency " + msg.getReg());
                     // Keep STOP evidence for future regencies to allow jumping nextReg after f+1 STOPs.
                     lcManager.addStop(msg.getReg(), msg.getSender());
