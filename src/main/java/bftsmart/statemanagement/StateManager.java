@@ -60,6 +60,8 @@ public abstract class StateManager {
 
     protected boolean appStateOnly;
     protected int waitingCID = -1;
+    // Highest consensus ID requested while state transfer is active.
+    protected int targetCID = -1;
     protected int queryID = -1;
     protected int lastCID;
     protected ApplicationState state;
@@ -188,9 +190,17 @@ public abstract class StateManager {
 
     public void requestAppState(int cid) {
         lastCID = cid + 1;
-        waitingCID = cid;
-        logger.debug("Updated waitingcid to " + cid);
         appStateOnly = true;
+        targetCID = Math.max(targetCID, cid);
+
+        if (waitingCID != -1) {
+            logger.info("State transfer already in progress for waitingCID {}. Keeping current transfer and updating targetCID to {}",
+                    waitingCID, targetCID);
+            return;
+        }
+
+        waitingCID = targetCID;
+        logger.debug("Starting app-state transfer for waitingCID {} (targetCID={})", waitingCID, targetCID);
         requestState();
     }
 
@@ -202,6 +212,7 @@ public abstract class StateManager {
                 logger.info("I have now more than " + SVController.getCurrentViewF() + " messages for CID " + cid + " which are beyond CID " + lastCID);
                 lastCID = cid;
                 waitingCID = cid - 1;
+                targetCID = waitingCID;
                 logger.info("I will be waiting for state messages associated to consensus " + waitingCID);
                 requestState();
             }
@@ -326,6 +337,7 @@ public abstract class StateManager {
                         lastCID = cid + 1;
                         if (waitingCID == -1) {
                             waitingCID = cid;
+                            targetCID = waitingCID;
                             requestState();
                         }
                     }
@@ -344,6 +356,7 @@ public abstract class StateManager {
         state = null;
         lastCID = -1;
         waitingCID = -1;
+        targetCID = -1;
 
         appStateOnly = false;
     }

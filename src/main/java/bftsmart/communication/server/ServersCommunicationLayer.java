@@ -228,6 +228,7 @@ public class ServersCommunicationLayer extends Thread {
 		}
 
 		byte[] data = bOut.toByteArray();
+		OutboundServerMessage outboundMessage = OutboundServerMessage.from(data, sm);
 
 		// this shuffling is done to prevent the replica with the lowest ID/index  from being always
 		// the last one receiving the messages, which can result in that replica  to become consistently
@@ -244,7 +245,7 @@ public class ServersCommunicationLayer extends Thread {
 					logger.debug("Queueing (delivering) my own message, me:{}", target);
 				} else {
 					logger.debug("Sending message from:{} -> to:{}.", me,  target);
-					getConnection(target).send(data);
+					getConnection(target).send(outboundMessage);
 				}
 			} catch (InterruptedException ex) {
 				logger.error("Interruption while inserting message into inqueue", ex);

@@ -55,8 +55,10 @@ public class StandardStateManager extends StateManager {
     private int replica;
     private ReentrantLock lockTimer = new ReentrantLock();
     private Timer stateTimer = null;
+    private Timer periodicStateRequestTimer = null;
     private final static long INIT_TIMEOUT = 40000;
     private final static long MAX_TIMEOUT = 300000; // 5 minutes cap for state-transfer retry backoff
+    private final static long PERIODIC_STATE_REQUEST_RETRY_MS = 2500;
     private long timeout = INIT_TIMEOUT;
 
     @Override
@@ -96,11 +98,8 @@ public class StandardStateManager extends StateManager {
 
         changeReplica(); // always ask the complete state to a different replica
 
-        SMMessage smsg = new StandardSMMessage(SVController.getStaticConf().getProcessId(),
-                waitingCID, TOMUtil.SM_REQUEST, replica, null, null, -1, -1);
-        tomLayer.getCommunication().send(SVController.getCurrentViewOtherAcceptors(), smsg);
-
-        logger.info("I just sent a request to the other replicas for the state up to CID " + waitingCID);
+        sendStateRequest(waitingCID, replica);
+        restartPeriodicStateRequestRetry();
 
         TimerTask stateTask = new TimerTask() {
             public void run() {
@@ -117,6 +116,43 @@ public class StandardStateManager extends StateManager {
             timeout = timeout * 2;
         }
         stateTimer.schedule(stateTask, timeout);
+    }
+
+    private void sendStateRequest(int cid, int expectedReplica) {
+        SMMessage smsg = new StandardSMMessage(SVController.getStaticConf().getProcessId(),
+                cid, TOMUtil.SM_REQUEST, expectedReplica, null, null, -1, -1);
+        tomLayer.getCommunication().send(SVController.getCurrentViewOtherAcceptors(), smsg);
+        logger.info("I just sent a request to the other replicas for the state up to CID " + cid
+                + " (expectedReplica=" + expectedReplica + ")");
+    }
+
+    private void restartPeriodicStateRequestRetry() {
+        cancelPeriodicStateRequestRetry();
+        periodicStateRequestTimer = new Timer("state periodic retry timer");
+        periodicStateRequestTimer.scheduleAtFixedRate(new TimerTask() {
+            @Override
+            public void run() {
+                lockTimer.lock();
+                try {
+                    if (waitingCID == -1 || !SVController.getStaticConf().isStateTransferEnabled()) {
+                        cancelPeriodicStateRequestRetry();
+                        return;
+                    }
+
+                    logger.info("Periodic state-transfer retry for CID {} (expectedReplica={})", waitingCID, replica);
+                    sendStateRequest(waitingCID, replica);
+                } finally {
+                    lockTimer.unlock();
+                }
+            }
+        }, PERIODIC_STATE_REQUEST_RETRY_MS, PERIODIC_STATE_REQUEST_RETRY_MS);
+    }
+
+    private void cancelPeriodicStateRequestRetry() {
+        if (periodicStateRequestTimer != null) {
+            periodicStateRequestTimer.cancel();
+            periodicStateRequestTimer = null;
+        }
     }
 
     @Override
@@ -179,10 +215,11 @@ public class StandardStateManager extends StateManager {
                 int serializedBytes = (replyState != null && replyState.getSerializedState() != null)
                         ? replyState.getSerializedState().length : -1;
                 logger.info(
-                        "Received SM_REPLY from replica {} for CID {} (waitingCID={}, appStateOnly={}, expectedReplica={}, hasState={}, serializedBytes={})",
+                        "Received SM_REPLY from replica {} for CID {} (waitingCID={}, targetCID={}, appStateOnly={}, expectedReplica={}, hasState={}, serializedBytes={})",
                         msg.getSender(),
                         msg.getCID(),
                         waitingCID,
+                        targetCID,
                         appStateOnly,
                         replica,
                         (replyState != null && replyState.hasState()),
@@ -346,7 +383,9 @@ public class StandardStateManager extends StateManager {
 
                         logger.info("Pausing decision delivery before applying transferred state for CID {}", waitingCID);
                         dt.pauseDecisionDelivery();
+                        cancelPeriodicStateRequestRetry();
                         waitingCID = -1;
+                        targetCID = -1;
                         logger.info("Invoking DeliveryThread.update with transferred state (lastCID={})", state.getLastCID());
                         dt.update(state);
                         logger.info("DeliveryThread.update completed (lastCID={})", state.getLastCID());
@@ -381,8 +420,13 @@ public class StandardStateManager extends StateManager {
 
                         logger.info("I updated the state!");
 
-                        tomLayer.requestsTimer.Enabled(true);
-                        tomLayer.requestsTimer.startTimer();
+                        if (tomLayer.requestsTimer != null) {
+                            int refreshedRequests = tomLayer.requestsTimer.refreshWatchedTimeoutsAfterStateTransfer();
+                            logger.info("Refreshed timeout tracking for {} watched requests after state transfer",
+                                    refreshedRequests);
+                            tomLayer.requestsTimer.Enabled(true);
+                            tomLayer.requestsTimer.startTimer();
+                        }
                         if (stateTimer != null) {
                             stateTimer.cancel();
                         }
@@ -393,13 +437,18 @@ public class StandardStateManager extends StateManager {
                             tomLayer.getSynchronizer().resumeLC();
                         }
                     } else if (otherReplicaState == null && (SVController.getCurrentViewN() / 2) < getReplies()) {
+                        int retryCID = (targetCID >= 0 ? targetCID : waitingCID);
                         logger.info(
                                 "State transfer branch (CID {}): missing comparison state despite replies={} (> N/2={}), resetting and{}",
                                 waitingCID,
                                 getReplies(),
                                 (SVController.getCurrentViewN() / 2),
                                 (appStateOnly ? " re-requesting app state" : " waiting for next trigger"));
+                        cancelPeriodicStateRequestRetry();
                         waitingCID = -1;
+                        if (!appStateOnly) {
+                            targetCID = -1;
+                        }
                         reset();
 
                         if (stateTimer != null) {
@@ -407,6 +456,8 @@ public class StandardStateManager extends StateManager {
                         }
 
                         if (appStateOnly) {
+                            waitingCID = retryCID;
+                            logger.info("Retrying app-state transfer after missing comparison state for CID {}", waitingCID);
                             requestState();
                         }
                     } else if (haveState == -1) {
@@ -433,7 +484,9 @@ public class StandardStateManager extends StateManager {
                         if (stateTimer != null) {
                             stateTimer.cancel();
                         }
+                        cancelPeriodicStateRequestRetry();
                         waitingCID = -1;
+                        targetCID = -1;
                         //requestState();
                     } else {
                         logger.info("State transfer not yet finished for CID {} (haveState={}, otherReplicaStatePresent={}, replies={}, required>{})",

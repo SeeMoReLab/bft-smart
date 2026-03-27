@@ -111,8 +111,9 @@ public class DurableStateManager extends StateManager {
         if (SVController.getStaticConf().isStateTransferEnabled()
                 && dt.getRecoverer() != null) {
             logger.debug("The state transfer protocol is enabled");
-            logger.debug("I received a state request for CID "
-                    + msg.getCID() + " from replica " + msg.getSender());
+            logger.info("Received SM_REQUEST from replica {} for CID {}",
+                    msg.getSender(),
+                    msg.getCID());
             CSTSMMessage cstMsg = (CSTSMMessage) msg;
             CSTRequestF1 cstConfig = cstMsg.getCstConfig();
             boolean sendState = cstConfig.getCheckpointReplica() == SVController
@@ -121,7 +122,10 @@ public class DurableStateManager extends StateManager {
                 logger.debug("I should be the one sending the state");
             }
 
-            logger.info("State asked by replica " + msg.getSender());
+            logger.info("State asked by replica {} for CID {} (sendState={})",
+                    msg.getSender(),
+                    msg.getCID(),
+                    sendState);
 
             int[] targets = {msg.getSender()};
             InetSocketAddress address = SVController.getCurrentView().getAddress(
@@ -354,6 +358,7 @@ public class DurableStateManager extends StateManager {
 
                         // this makes the isRetrievingState() evaluates to false
                         waitingCID = -1;
+                        targetCID = -1;
                         dt.update(stateUpper);
 
                         // Deal with stopped messages that may come from
@@ -386,8 +391,13 @@ public class DurableStateManager extends StateManager {
 
                         logger.info("I updated the state!");
 
-                        tomLayer.requestsTimer.Enabled(true);
-                        tomLayer.requestsTimer.startTimer();
+                        if (tomLayer.requestsTimer != null) {
+                            int refreshedRequests = tomLayer.requestsTimer.refreshWatchedTimeoutsAfterStateTransfer();
+                            logger.info("Refreshed timeout tracking for {} watched requests after state transfer",
+                                    refreshedRequests);
+                            tomLayer.requestsTimer.Enabled(true);
+                            tomLayer.requestsTimer.startTimer();
+                        }
                         if (stateTimer != null) {
                             stateTimer.cancel();
                         }
@@ -398,6 +408,7 @@ public class DurableStateManager extends StateManager {
                         }
                     } else if (state == null
                             && (SVController.getCurrentViewN() / 2) < getReplies()) {
+                        int retryCID = (targetCID >= 0 ? targetCID : waitingCID);
                         logger.warn("---- DIDNT RECEIVE STATE ----");
 
                         logger.debug("I have more than "
@@ -405,6 +416,9 @@ public class DurableStateManager extends StateManager {
                                 + " messages that are no good!");
 
                         waitingCID = -1;
+                        if (!appStateOnly) {
+                            targetCID = -1;
+                        }
                         reset();
 
                         if (stateTimer != null) {
@@ -412,6 +426,7 @@ public class DurableStateManager extends StateManager {
                         }
 
                         if (appStateOnly) {
+                            waitingCID = retryCID;
                             requestState();
                         }
                     } else if (!haveState) {
