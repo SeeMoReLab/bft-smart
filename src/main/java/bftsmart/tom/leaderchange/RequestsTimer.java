@@ -215,6 +215,37 @@ public class RequestsTimer {
         }
         rwLock.writeLock().unlock();
     }
+
+    public int refreshWatchedTimeoutsAfterStateTransfer() {
+        return refreshWatchedTimeouts("state transfer");
+    }
+
+    public int refreshWatchedTimeoutsAfterViewInstall() {
+        return refreshWatchedTimeouts("view install");
+    }
+
+    private int refreshWatchedTimeouts(String reason) {
+        long now = System.currentTimeMillis();
+        int refreshed = 0;
+
+        rwLock.writeLock().lock();
+        try {
+            for (TOMMessage request : watched) {
+                if (request == null) {
+                    continue;
+                }
+
+                request.receptionTimestamp = now;
+                request.timeout = false;
+                refreshed++;
+            }
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+
+        logger.info("Refreshed timeout tracking for {} watched request(s) after {}", refreshed, reason);
+        return refreshed;
+    }
     
     public void run_lc_protocol() {
         
@@ -414,27 +445,30 @@ public class RequestsTimer {
     }
 
     public void onViewInstalled() {
+        int refreshedRequests = refreshWatchedTimeoutsAfterViewInstall();
+
         synchronized (backoffLock) {
             if (!timeoutBackoffEnabled) {
                 resetBackoffStateLocked();
-                return;
-            }
-
-            if (!isSuccessBasedDecayEnabled()) {
-                resetBackoffOnNextViewChange = true;
-            } else if (backoffDecayTiming == BackoffDecayTiming.NEXT_VIEW && pendingDecaySteps > 0) {
-                applyDecayStepsLocked(pendingDecaySteps);
-                pendingDecaySteps = 0;
+            } else {
+                if (!isSuccessBasedDecayEnabled()) {
+                    resetBackoffOnNextViewChange = true;
+                } else if (backoffDecayTiming == BackoffDecayTiming.NEXT_VIEW && pendingDecaySteps > 0) {
+                    applyDecayStepsLocked(pendingDecaySteps);
+                    pendingDecaySteps = 0;
+                }
             }
         }
 
-        logger.info("View installed");
+        logger.info("View installed (refreshed watched requests={})", refreshedRequests);
     }
 
     public void onSequenceExecuted(int consensusId) {
         long steps = 0;
+        long multiplierBefore = 1;
         long multiplierAfter = 1;
         boolean applyNow = false;
+        boolean queuedForNextView = false;
 
         synchronized (backoffLock) {
             if (!timeoutBackoffEnabled || !isSuccessBasedDecayEnabled()) {
@@ -452,28 +486,36 @@ public class RequestsTimer {
 
             steps = successfulSequencesSinceDecay / decayAfterSuccessfulSequences;
             successfulSequencesSinceDecay = successfulSequencesSinceDecay % decayAfterSuccessfulSequences;
+            multiplierBefore = backoffMultiplier;
 
             if (backoffDecayTiming == BackoffDecayTiming.CURRENT_VIEW) {
                 applyDecayStepsLocked(steps);
                 applyNow = true;
             } else {
                 pendingDecaySteps = safeAdd(pendingDecaySteps, steps);
+                queuedForNextView = true;
             }
 
             multiplierAfter = backoffMultiplier;
         }
 
-        if (applyNow) {
+        if (queuedForNextView) {
+            logger.info(
+                    "Queued {} timeout-backoff decay step(s) after successful sequence {} for next view",
+                    steps,
+                    consensusId);
+        } else if (applyNow && multiplierAfter < multiplierBefore) {
             logger.info(
                     "Applied {} timeout-backoff decay step(s) after successful sequence {}. Multiplier={}",
                     steps,
                     consensusId,
                     multiplierAfter);
-        } else {
+        } else if (applyNow) {
             logger.info(
-                    "Queued {} timeout-backoff decay step(s) after successful sequence {} for next view",
+                    "Computed {} timeout-backoff decay step(s) after successful sequence {}, but multiplier is already at floor ({})",
                     steps,
-                    consensusId);
+                    consensusId,
+                    multiplierAfter);
         }
     }
 
