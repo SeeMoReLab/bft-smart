@@ -219,6 +219,25 @@ public class RequestsTimer {
     public void run_lc_protocol() {
         
         long t = getTimeout();
+
+        if (tomLayer.isRetrievingState()) {
+            int watchedCount;
+
+            rwLock.readLock().lock();
+            try {
+                watchedCount = watched.size();
+            } finally {
+                rwLock.readLock().unlock();
+            }
+
+            logger.info(
+                    "Skipping request-timeout leader-change trigger while retrieving state (watchedRequests={})",
+                    watchedCount);
+
+            rtTask = new RequestTimerTask();
+            timer.schedule(rtTask, t);
+            return;
+        }
         
         //System.out.println("(RequestTimerTask.run) I SOULD NEVER RUN WHEN THERE IS NO TIMEOUT");
 
