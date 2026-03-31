@@ -43,7 +43,7 @@ public class SmallBankServer extends DefaultRecoverable {
     private TreeMap<Long, Double> checking;
     private TreeMap<Long, Double> savings;
 
-    private boolean logPrinted = false;
+    private int lastLoggedConsensusId = -1;
 
     /* Adaptive timers */
     private TimeoutLearningWindowMetrics learningMetrics;
@@ -232,11 +232,12 @@ public class SmallBankServer extends DefaultRecoverable {
         int index = 0;
         for (byte[] command : commands) {
             MessageContext currentMsgCtx = (msgCtx != null) ? msgCtx[index] : null;
-            if (currentMsgCtx != null && currentMsgCtx.getConsensusId() % 1000 == 0 && !logPrinted) {
-                System.out.println("SmallBankServer executing CID: " + currentMsgCtx.getConsensusId());
-                logPrinted = true;
-            } else {
-                logPrinted = false;
+            if (currentMsgCtx != null) {
+                int consensusId = currentMsgCtx.getConsensusId();
+                if (consensusId % 100 == 0 && consensusId != lastLoggedConsensusId) {
+                    System.out.println("SmallBankServer executing CID: " + consensusId);
+                    lastLoggedConsensusId = consensusId;
+                }
             }
 
             if (currentMsgCtx != null) {
