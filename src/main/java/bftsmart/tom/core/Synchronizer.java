@@ -538,8 +538,12 @@ public class Synchronizer {
             lcManager.clearCurrentRequestTimedOut();
             lcManager.clearRequestsFromSTOP();
 
+            int refreshedRequests = requestsTimer.refreshWatchedTimeoutsAfterSynchronizationStart();
             requestsTimer.Enabled(true);
             requestsTimer.startTimer();
+            logger.info("Synchronization started for regency {} (refreshed watched requests={})",
+                    regency,
+                    refreshedRequests);
 
             //int leader = regency % this.reconfManager.getCurrentViewN(); // new leader
             int leader = lcManager.getNewLeader();

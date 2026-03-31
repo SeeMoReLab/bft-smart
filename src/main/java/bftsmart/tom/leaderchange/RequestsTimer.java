@@ -220,6 +220,10 @@ public class RequestsTimer {
         return refreshWatchedTimeouts("state transfer");
     }
 
+    public int refreshWatchedTimeoutsAfterSynchronizationStart() {
+        return refreshWatchedTimeouts("synchronization start");
+    }
+
     public int refreshWatchedTimeoutsAfterViewInstall() {
         return refreshWatchedTimeouts("view install");
     }
@@ -445,8 +449,6 @@ public class RequestsTimer {
     }
 
     public void onViewInstalled() {
-        int refreshedRequests = refreshWatchedTimeoutsAfterViewInstall();
-
         synchronized (backoffLock) {
             if (!timeoutBackoffEnabled) {
                 resetBackoffStateLocked();
@@ -460,7 +462,7 @@ public class RequestsTimer {
             }
         }
 
-        logger.info("View installed (refreshed watched requests={})", refreshedRequests);
+        logger.info("View installed");
     }
 
     public void onSequenceExecuted(int consensusId) {
@@ -511,7 +513,7 @@ public class RequestsTimer {
                     consensusId,
                     multiplierAfter);
         } else if (applyNow) {
-            logger.info(
+            logger.debug(
                     "Computed {} timeout-backoff decay step(s) after successful sequence {}, but multiplier is already at floor ({})",
                     steps,
                     consensusId,
