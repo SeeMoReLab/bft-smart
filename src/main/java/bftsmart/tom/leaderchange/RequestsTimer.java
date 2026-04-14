@@ -61,6 +61,7 @@ public class RequestsTimer {
 
     private Timer timer = new Timer("request timer");
     private RequestTimerTask rtTask = null;
+    private final Object rtTaskLock = new Object();
     private TOMLayer tomLayer; // TOM layer
     private long timeout;
     private long shortTimeout;
@@ -77,7 +78,7 @@ public class RequestsTimer {
     private TreeSet<TOMMessage> watched = new TreeSet<TOMMessage>();
     private ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
     
-    private boolean enabled = true;
+    private volatile boolean enabled = true;
     
     private ServerCommunicationSystem communication; // Communication system between replicas
     private ServerViewController controller; // Reconfiguration manager
@@ -151,18 +152,25 @@ public class RequestsTimer {
     }
     
     public void startTimer() {
-        if (rtTask == null) {
-            long t = getTimeout();
-            //shortTimeout = -1;
-            rtTask = new RequestTimerTask();
-            if (controller.getCurrentViewN() > 1) timer.schedule(rtTask, t);
+        synchronized (rtTaskLock) {
+            if (rtTask == null) {
+                long t = getTimeout();
+                //shortTimeout = -1;
+                RequestTimerTask newTask = new RequestTimerTask();
+                if (controller.getCurrentViewN() > 1) {
+                    timer.schedule(newTask, t);
+                }
+                rtTask = newTask;
+            }
         }
     }
     
     public void stopTimer() {
-        if (rtTask != null) {
-            rtTask.cancel();
-            rtTask = null;
+        synchronized (rtTaskLock) {
+            if (rtTask != null) {
+                rtTask.cancel();
+                rtTask = null;
+            }
         }
     }
     
@@ -269,8 +277,7 @@ public class RequestsTimer {
                     "Skipping request-timeout leader-change trigger while retrieving state (watchedRequests={})",
                     watchedCount);
 
-            rtTask = new RequestTimerTask();
-            timer.schedule(rtTask, t);
+            scheduleNewRtTask(t);
             return;
         }
         
@@ -319,17 +326,23 @@ public class RequestsTimer {
                 tomLayer.getSynchronizer().triggerTimeout(pendingRequests);
             }
             else {
-                rtTask = new RequestTimerTask();
-                timer.schedule(rtTask, t);
+                scheduleNewRtTask(t);
             }
         } else {
             
             logger.debug("Timeout triggered with no expired requests");
             
-            rtTask = new RequestTimerTask();
-            timer.schedule(rtTask, t);
+            scheduleNewRtTask(t);
         }
         
+    }
+
+    private void scheduleNewRtTask(long delayMs) {
+        synchronized (rtTaskLock) {
+            RequestTimerTask newTask = new RequestTimerTask();
+            timer.schedule(newTask, delayMs);
+            rtTask = newTask;
+        }
     }
     
     public void setSTOP(int regency, LCMessage stop) {
