@@ -19,7 +19,6 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Random;
 
-import bftsmart.reconfiguration.ServerViewController;
 import bftsmart.tom.core.messages.TOMMessage;
 
 import org.slf4j.Logger;
@@ -56,7 +55,7 @@ public final class BatchBuilder {
                             
                     for (byte[] sig : signatures) {
 
-                        sigsSize += sig.length;
+                        sigsSize += (sig != null ? sig.length : 0);
                     }
                 }
                 
