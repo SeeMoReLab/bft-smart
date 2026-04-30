@@ -20,6 +20,7 @@ import bftsmart.tom.core.messages.TOMMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Arrays;
 import java.util.TreeMap;
 
 /**
@@ -170,11 +171,28 @@ public class StateLog {
      * @param lastConsensusId
      */
     public void addMessageBatch(byte[][] commands, MessageContext[] msgCtx, int lastConsensusId) {
+        if (messageBatches == null) {
+            logger.error(
+                    "Cannot store message batch for CID {}: message batch buffer is uninitialized (lastCheckpointCID={}, currentLastCID={})",
+                    lastConsensusId,
+                    lastCheckpointCID,
+                    this.lastCID);
+            return;
+        }
+
         if (position < messageBatches.length) {
             messageBatches[position] = new CommandsInfo(commands, msgCtx);
             position++;
+            setLastCID(lastConsensusId);
+        } else {
+            logger.error(
+                    "Cannot store message batch for CID {}: log window is full (position={}, capacity={}, lastCheckpointCID={}, currentLastCID={})",
+                    lastConsensusId,
+                    position,
+                    messageBatches.length,
+                    lastCheckpointCID,
+                    this.lastCID);
         }
-        setLastCID(lastConsensusId);
     }
 
     public TreeMap<Integer, TOMMessage> getLastReplies() {
@@ -246,7 +264,7 @@ public class StateLog {
     	logger.info("CID requested: " + cid + ". Last checkpoint: " + lastCheckpointCID + ". Last CID: " + this.lastCID);
         CommandsInfo[] batches = null;
 
-        int lastCID = -1;
+        int stateLastCID = -1;
        
         if (cid >= lastCheckpointCID && cid <= this.lastCID) {
             
@@ -255,13 +273,55 @@ public class StateLog {
             int size = cid - lastCheckpointCID ;
 
             if (size > 0) {
-                batches = new CommandsInfo[size];
+                if (messageBatches == null) {
+                    logger.warn(
+                            "Cannot construct ApplicationState up to CID {}: message batch buffer is null (size={}, lastCheckpointCID={}, logLastCID={})",
+                            cid,
+                            size,
+                            lastCheckpointCID,
+                            this.lastCID);
+                    return null;
+                }
 
-                for (int i = 0; i < size; i++)
-                    batches[i] = messageBatches[i];
+                int available = Math.min(position, messageBatches.length);
+                if (size > available) {
+                    logger.warn(
+                            "Cannot construct ApplicationState up to CID {}: requested {} batches but only {} are available (position={}, capacity={}, lastCheckpointCID={}, logLastCID={})",
+                            cid,
+                            size,
+                            available,
+                            position,
+                            messageBatches.length,
+                            lastCheckpointCID,
+                            this.lastCID);
+                    return null;
+                }
+
+                int firstMissingIndex = -1;
+                for (int i = 0; i < size; i++) {
+                    if (messageBatches[i] == null) {
+                        firstMissingIndex = i;
+                        break;
+                    }
+                }
+
+                if (firstMissingIndex >= 0) {
+                    int missingCid = lastCheckpointCID + 1 + firstMissingIndex;
+                    logger.warn(
+                            "Cannot construct ApplicationState up to CID {}: message batch entry is null at index {} (expectedCID={}, lastCheckpointCID={}, logLastCID={})",
+                            cid,
+                            firstMissingIndex,
+                            missingCid,
+                            lastCheckpointCID,
+                            this.lastCID);
+                    return null;
+                }
+
+                batches = new CommandsInfo[size];
+                System.arraycopy(messageBatches, 0, batches, 0, size);
             }
-            lastCID = cid;
-            return new DefaultApplicationState(batches, lastCheckpointCID, lastCID, (setState ? state : null),
+            stateLastCID = cid;
+            return new DefaultApplicationState(batches, lastCheckpointCID, stateLastCID, (setState ? state : null),
                     stateHash, this.id, this.lastReplies, this.lastRepliesHash);
 
         }
@@ -275,10 +335,27 @@ public class StateLog {
     public void update(DefaultApplicationState transState) {
 
         position = 0;
-        if (transState.getMessageBatches() != null) {
-            for (int i = 0; i < transState.getMessageBatches().length; i++, position = i) {
-                this.messageBatches[i] = transState.getMessageBatches()[i];
+
+        CommandsInfo[] transferredBatches = transState.getMessageBatches();
+        if (this.messageBatches != null) {
+            Arrays.fill(this.messageBatches, null);
+        }
+
+        if (transferredBatches != null && this.messageBatches != null) {
+            int copiedBatches = Math.min(transferredBatches.length, this.messageBatches.length);
+            for (int i = 0; i < copiedBatches; i++) {
+                this.messageBatches[i] = transferredBatches[i];
             }
+            position = copiedBatches;
+
+            if (transferredBatches.length > this.messageBatches.length) {
+                logger.warn(
+                        "Received {} message batches from transferred state but local capacity is {}; truncating extra batches",
+                        transferredBatches.length,
+                        this.messageBatches.length);
+            }
+        } else if (transferredBatches != null) {
+            logger.warn("Transferred state contains message batches but local in-memory log capacity is not initialized");
         }
 
         this.lastCheckpointCID = transState.getLastCheckpointCID();
