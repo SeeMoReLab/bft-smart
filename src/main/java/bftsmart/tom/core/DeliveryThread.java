@@ -354,22 +354,41 @@ public final class DeliveryThread extends Thread {
 
 	private TOMMessage[] extractMessagesFromDecision(Decision dec) {
 		Epoch decisionEpoch = dec.getDecisionEpoch();
-		TOMMessage[] requests = (decisionEpoch != null ? decisionEpoch.deserializedPropValue : null);
-		if (requests == null) {
-			// There are no cached deserialized requests, so decode from the decided value.
-			logger.debug("No cached requests for consensus {}. Interpreting and verifying batched requests.",
-					dec.getConsensusId());
-			byte[] decidedValue = (decisionEpoch != null ? decisionEpoch.propValue : null);
-			if (decidedValue == null) {
-				decidedValue = dec.getValue();
-			}
-			BatchReader batchReader = new BatchReader(decidedValue, controller.getStaticConf().getUseSignatures() == 1);
-			requests = batchReader.deserialiseRequests(controller);
-		} else {
-			logger.debug("Using cached requests from the propose.");
+		byte[] decidedValue = dec.getValue();
+		if (decidedValue == null && decisionEpoch != null) {
+			decidedValue = decisionEpoch.propValue;
 		}
 
-		return requests;
+		// Safety first: execute what was actually decided (dec.getValue()),
+		// not whatever happened to be cached in the local epoch object.
+		if (decidedValue != null) {
+			BatchReader batchReader = new BatchReader(
+					decidedValue,
+					controller.getStaticConf().getUseSignatures() == 1);
+			TOMMessage[] decoded = batchReader.deserialiseRequests(controller);
+			if (decoded != null) {
+				if (decisionEpoch != null) {
+					decisionEpoch.deserializedPropValue = decoded;
+				}
+				return decoded;
+			}
+			logger.warn(
+					"Failed to decode decided value for consensus {}. Falling back to cached deserialized requests if available.",
+					dec.getConsensusId());
+		}
+
+		TOMMessage[] cachedRequests = (decisionEpoch != null ? decisionEpoch.deserializedPropValue : null);
+		if (cachedRequests != null) {
+			logger.warn(
+					"Consensus {} using cached deserialized requests because decided value was null/malformed",
+					dec.getConsensusId());
+			return cachedRequests;
+		}
+
+		logger.warn(
+				"Consensus {} has neither decodable decided value nor cached requests; returning empty request array",
+				dec.getConsensusId());
+		return new TOMMessage[0];
 	}
 
 	public void deliverUnordered(TOMMessage request, int regency) {
