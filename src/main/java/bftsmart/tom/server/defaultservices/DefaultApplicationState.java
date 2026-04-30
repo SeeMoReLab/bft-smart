@@ -21,7 +21,10 @@ import bftsmart.statemanagement.ApplicationState;
 import bftsmart.tom.core.messages.TOMMessage;
 import bftsmart.tom.leaderchange.CertifiedDecision;
 import bftsmart.tom.util.BatchBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.Set;
@@ -37,6 +40,7 @@ import java.util.TreeMap;
 public class DefaultApplicationState implements ApplicationState {
 
     private static final long serialVersionUID = 6771081456095596363L;
+    private static final Logger logger = LoggerFactory.getLogger(DefaultApplicationState.class);
 
     protected byte[] state; // State associated with the last checkpoint
     protected byte[] stateHash; // Hash of the state associated with the last checkpoint
@@ -138,28 +142,127 @@ public class DefaultApplicationState implements ApplicationState {
      */
     @Override
     public CertifiedDecision getCertifiedDecision(ServerViewController controller) {
-        CommandsInfo ci = getMessageBatch(getLastCID());
-        if (ci != null && ci.msgCtx[0].getProof() != null) { // do I have a proof for the consensus?
-            
-            Set<ConsensusMessage> proof = ci.msgCtx[0].getProof();
-            LinkedList<TOMMessage> requests = new LinkedList<>();
-            
-            //Recreate all TOMMessages ordered in the consensus
-            for (int i = 0; i < ci.commands.length; i++) {
-                
-                requests.add(ci.msgCtx[i].recreateTOMMessage(ci.commands[i]));
-                
-            }
-            
-            //Serialize the TOMMessages to re-create the proposed value
-            BatchBuilder bb = new BatchBuilder(0);
-            byte[] value = bb.makeBatch(requests, ci.msgCtx[0].getNumOfNonces(),
-                    ci.msgCtx[0].getSeed(), ci.msgCtx[0].getTimestamp(), controller.getStaticConf().getUseSignatures() == 1);
-            
-            //Assemble and return the certified decision
-            return new CertifiedDecision(pid, getLastCID(), value, proof);
+        int cid = getLastCID();
+        CommandsInfo ci = getMessageBatch(cid);
+        if (ci == null) {
+            logger.info(
+                    "Cannot build certified decision for CID {}: no message batch in state window [lastCheckpointCID={}, lastCID={}]",
+                    cid,
+                    lastCheckpointCID,
+                    lastCID);
+            return null;
         }
-        else return null; // there was no proof for the consensus
+        if (ci.msgCtx == null || ci.msgCtx.length == 0 || ci.msgCtx[0] == null) {
+            logger.info(
+                    "Cannot build certified decision for CID {}: missing message contexts (msgCtxNull={}, msgCtxLen={})",
+                    cid,
+                    (ci.msgCtx == null),
+                    (ci.msgCtx == null ? -1 : ci.msgCtx.length));
+            return null;
+        }
+
+        Set<ConsensusMessage> proof = ci.msgCtx[0].getProof();
+        if (proof == null || proof.isEmpty()) {
+            logger.info(
+                    "Cannot build certified decision for CID {}: proof payload is missing or empty (proofNull={}, proofSize={})",
+                    cid,
+                    (proof == null),
+                    (proof == null ? -1 : proof.size()));
+            return null;
+        }
+        if (ci.commands == null || ci.commands.length == 0) {
+            logger.info(
+                    "Cannot build certified decision for CID {}: command batch is missing (commandsNull={}, commandsLen={})",
+                    cid,
+                    (ci.commands == null),
+                    (ci.commands == null ? -1 : ci.commands.length));
+            return null;
+        }
+
+        // Synthetic no-op entries (empty decided batch) should keep the exact decided bytes
+        // to preserve proof/hash consistency during state transfer and leader change.
+        boolean syntheticEmptyNoOpEntry = ci.commands.length == 1
+                && ci.msgCtx.length == 1
+                && ci.msgCtx[0].isNoOp()
+                && ci.msgCtx[0].getFirstInBatch() == null;
+        if (syntheticEmptyNoOpEntry) {
+            byte[] decidedValue = ci.commands[0];
+            Integer numberOfMessages = extractBatchMessageCount(decidedValue);
+            if (numberOfMessages == null) {
+                logger.info(
+                        "Cannot build certified decision for CID {}: synthetic no-op entry has null/malformed decided value (bytes={})",
+                        cid,
+                        (decidedValue == null ? -1 : decidedValue.length));
+                return null;
+            }
+            if (numberOfMessages != 0) {
+                logger.error(
+                        "Cannot build certified decision for CID {}: synthetic no-op entry has non-empty decided value (numMessages={})",
+                        cid,
+                        numberOfMessages);
+                return null;
+            }
+            logger.debug("Building certified decision for CID {} directly from stored empty-batch decided value", cid);
+            return new CertifiedDecision(pid, cid, decidedValue, proof);
+        }
+
+        if (ci.msgCtx.length < ci.commands.length) {
+            logger.info(
+                    "Cannot build certified decision for CID {}: context/command length mismatch (commandsLen={}, msgCtxLen={})",
+                    cid,
+                    ci.commands.length,
+                    ci.msgCtx.length);
+            return null;
+        }
+
+        LinkedList<TOMMessage> requests = new LinkedList<>();
+
+        // Recreate all TOMMessages ordered in the consensus.
+        for (int i = 0; i < ci.commands.length; i++) {
+            if (ci.msgCtx[i] == null) {
+                logger.info(
+                        "Cannot build certified decision for CID {}: msgCtx[{}] is null while commandsLen={}",
+                        cid,
+                        i,
+                        ci.commands.length);
+                return null;
+            }
+            requests.add(ci.msgCtx[i].recreateTOMMessage(ci.commands[i]));
+        }
+
+        // Serialize TOMMessages to re-create the proposed value.
+        BatchBuilder bb = new BatchBuilder(0);
+        byte[] value = bb.makeBatch(requests, ci.msgCtx[0].getNumOfNonces(),
+                ci.msgCtx[0].getSeed(), ci.msgCtx[0].getTimestamp(), controller.getStaticConf().getUseSignatures() == 1);
+
+        return new CertifiedDecision(pid, cid, value, proof);
+    }
+
+    private Integer extractBatchMessageCount(byte[] decidedValue) {
+        if (decidedValue == null || decidedValue.length < (Long.BYTES + Integer.BYTES + Integer.BYTES)) {
+            return null;
+        }
+        try {
+            ByteBuffer proposalBuffer = ByteBuffer.wrap(decidedValue);
+            proposalBuffer.getLong(); // timestamp
+            int numberOfNonces = proposalBuffer.getInt();
+            if (numberOfNonces < 0) {
+                return null;
+            }
+            if (numberOfNonces > 0) {
+                if (proposalBuffer.remaining() < (Long.BYTES + Integer.BYTES)) {
+                    return null;
+                }
+                proposalBuffer.getLong(); // seed
+            }
+            if (proposalBuffer.remaining() < Integer.BYTES) {
+                return null;
+            }
+            int numberOfMessages = proposalBuffer.getInt();
+            return numberOfMessages >= 0 ? numberOfMessages : null;
+        } catch (RuntimeException ignored) {
+            return null;
+        }
     }
 
     /**
@@ -205,7 +308,7 @@ public class DefaultApplicationState implements ApplicationState {
      * @return The batch of messages associated with the batch correspondent consensus ID
      */
     public CommandsInfo getMessageBatch(int cid) {
-        if (messageBatches != null && cid >= lastCheckpointCID && cid <= lastCID) {
+        if (messageBatches != null && cid > lastCheckpointCID && cid <= lastCID) {
             return messageBatches[cid - lastCheckpointCID - 1];
         }
         else return null;

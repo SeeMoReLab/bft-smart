@@ -278,15 +278,72 @@ public abstract class DefaultRecoverable implements Recoverable, BatchExecutable
     @Override
     public ApplicationState getState(int cid, boolean sendState) {
         logLock.lock();
-        ApplicationState ret = (cid > -1 ? getLog().getApplicationState(cid, sendState) : new DefaultApplicationState());
-        
-        // Only will send a state if I have a proof for the last logged decision/consensus
-        //TODO: I should always make sure to have a log with proofs, since this is a result
-        // of not storing anything after a checkpoint and before logging more requests        
-        if (ret == null || (config.isBFT() && ret.getCertifiedDecision(this.controller) == null)) ret = new DefaultApplicationState();
-        
-        logLock.unlock();
-        return ret;
+        try {
+            StateLog thisLog = getLog();
+            int lastCheckpointCID = thisLog.getLastCheckpointCID();
+            int logLastCID = thisLog.getLastCID();
+            boolean inRange = (cid >= lastCheckpointCID && cid <= logLastCID);
+
+            logger.info(
+                    "getState request (cid={}, sendState={}) with log window [lastCheckpointCID={}, lastCID={}] (inRange={})",
+                    cid,
+                    sendState,
+                    lastCheckpointCID,
+                    logLastCID,
+                    inRange);
+
+            ApplicationState candidate = (cid > -1 ? thisLog.getApplicationState(cid, sendState) : new DefaultApplicationState());
+            if (candidate == null) {
+                logger.info(
+                        "getState returning empty fallback for cid {} because log returned null candidate (sendState={}, inRange={})",
+                        cid,
+                        sendState,
+                        inRange);
+                return new DefaultApplicationState();
+            }
+
+            boolean hasCertifiedDecision = true;
+            if (config.isBFT()) {
+                hasCertifiedDecision = candidate.getCertifiedDecision(this.controller) != null;
+            }
+
+            if (candidate instanceof DefaultApplicationState) {
+                DefaultApplicationState stateCandidate = (DefaultApplicationState) candidate;
+                int serializedBytes = (stateCandidate.getSerializedState() != null)
+                        ? stateCandidate.getSerializedState().length : -1;
+                CommandsInfo[] batches = stateCandidate.getMessageBatches();
+                int batchCount = (batches != null ? batches.length : 0);
+                logger.info(
+                        "getState candidate for cid {}: hasState={}, serializedBytes={}, candidateLastCheckpointCID={}, candidateLastCID={}, batchCount={}, bftCertifiedDecisionPresent={}",
+                        cid,
+                        stateCandidate.hasState(),
+                        serializedBytes,
+                        stateCandidate.getLastCheckpointCID(),
+                        stateCandidate.getLastCID(),
+                        batchCount,
+                        hasCertifiedDecision);
+            } else {
+                logger.info(
+                        "getState candidate for cid {} uses type {} (bftCertifiedDecisionPresent={})",
+                        cid,
+                        candidate.getClass().getName(),
+                        hasCertifiedDecision);
+            }
+
+            // Only will send a state if I have a proof for the last logged decision/consensus
+            //TODO: I should always make sure to have a log with proofs, since this is a result
+            // of not storing anything after a checkpoint and before logging more requests
+            if (config.isBFT() && !hasCertifiedDecision) {
+                logger.info(
+                        "getState returning empty fallback for cid {} because certified decision is missing in BFT mode",
+                        cid);
+                return new DefaultApplicationState();
+            }
+
+            return candidate;
+        } finally {
+            logLock.unlock();
+        }
     }
 
     @Override
@@ -315,78 +372,100 @@ public abstract class DefaultRecoverable implements Recoverable, BatchExecutable
            
             logger.info("Acquiring state lock to apply received state");
             stateLock.lock();
-            if (state.getSerializedState() != null) {
-                logger.info("The state is not null. Will install it");
-                logger.info("Installing snapshot and updating state log (snapshotBytes={})",
-                        state.getSerializedState().length);
-                initLog();
-                log.update(state);
-                installSnapshot(state.getSerializedState());
-                logger.info("Snapshot installation completed");
-
-                // Sets the reply store
-                if (controller.getStaticConf().useReadOnlyRequests()) {
-                    if (state.lastReplies.size() == 0) {
-                        logger.info("(DefaultRecoverable.setState): There are no replies to add to replica state");
+            try {
+                if (state.getSerializedState() != null) {
+                    logger.info("The state is not null. Will install it");
+                    logger.info("Installing snapshot and updating state log (snapshotBytes={})",
+                            state.getSerializedState().length);
+                    initLog();
+                    logLock.lock();
+                    try {
+                        log.update(state);
+                    } finally {
+                        logLock.unlock();
                     }
-                    // Give the last replies from received state to the clientManager, re-send in case a client waits for it
-                    if (clientsManager != null) {
-                        clientsManager.manageLastReplyOfEachClientAfterRecovery(state.lastReplies);
-                    } else {
-                        logger.warn("(DefaultRecoverable.setState): client manager is null, cannot set last replies of clients");
-                    }
-                }
-            } else {
-                logger.warn("Received state has null serialized snapshot for lastCID={}", lastCID);
-            }
+                    installSnapshot(state.getSerializedState());
+                    logger.info("Snapshot installation completed");
 
-            logger.info("Starting ordered batch replay from CID {} to CID {}",
-                    (lastCheckpointCID + 1),
-                    lastCID);
-            int replayedConsensus = 0;
-            int skippedConsensus = 0;
-            for (int cid = lastCheckpointCID + 1; cid <= lastCID; cid++) {
-                try {
-
-                    logger.debug("Processing and verifying batched requests for cid " + cid);
-                    if (state.getMessageBatch(cid) == null) {
-                        logger.warn("Consensus " + cid + " is null!");
+                    // Sets the reply store
+                    if (controller.getStaticConf().useReadOnlyRequests()) {
+                        if (state.lastReplies.size() == 0) {
+                            logger.info("(DefaultRecoverable.setState): There are no replies to add to replica state");
+                        }
+                        // Give the last replies from received state to the clientManager, re-send in case a client waits for it
+                        if (clientsManager != null) {
+                            clientsManager.manageLastReplyOfEachClientAfterRecovery(state.lastReplies);
+                        } else {
+                            logger.warn("(DefaultRecoverable.setState): client manager is null, cannot set last replies of clients");
+                        }
                     }
-
-                    CommandsInfo cmdInfo = state.getMessageBatch(cid); 
-                    byte[][] commands = cmdInfo.commands; // take a batch
-                    MessageContext[] msgCtx = cmdInfo.msgCtx;
-                    
-                    if (commands == null || msgCtx == null || msgCtx[0].isNoOp()) {
-                        skippedConsensus++;
-                        continue;
-                    }                        
-                    replayedConsensus++;
-                    appExecuteBatch(commands, msgCtx, false);
-                    if (replayedConsensus % 100 == 0 || cid == lastCID) {
-                        logger.info("Replay progress: replayed={}, skipped={}, currentCID={}",
-                                replayedConsensus,
-                                skippedConsensus,
-                                cid);
-                    }
-                    
-                } catch (Exception e) {
-                    logger.error("Failed to process and verify batched requests for cid " + cid, e);
-                    if (e instanceof ArrayIndexOutOfBoundsException) {
-                        logger.info("Last checkpoint, last consensus ID (CID): " + state.getLastCheckpointCID());
-                        logger.info("Last CID: " + state.getLastCID());
-                        logger.info("number of messages expected to be in the batch: " + (state.getLastCID() - state.getLastCheckpointCID() + 1));
-                        logger.info("number of messages in the batch: " + state.getMessageBatches().length);
-                     }
+                } else {
+                    logger.warn("Received state has null serialized snapshot for lastCID={}", lastCID);
                 }
 
+                logger.info("Starting ordered batch replay from CID {} to CID {}",
+                        (lastCheckpointCID + 1),
+                        lastCID);
+                int replayedConsensus = 0;
+                int skippedConsensus = 0;
+                for (int cid = lastCheckpointCID + 1; cid <= lastCID; cid++) {
+                    try {
+                        logger.debug("Processing and verifying batched requests for cid {}", cid);
+                        CommandsInfo cmdInfo = state.getMessageBatch(cid);
+                        if (cmdInfo == null) {
+                            logger.warn("Consensus {} has no batch entry in transferred state; skipping replay for this CID", cid);
+                            skippedConsensus++;
+                            continue;
+                        }
+
+                        byte[][] commands = cmdInfo.commands; // take a batch
+                        MessageContext[] msgCtx = cmdInfo.msgCtx;
+
+                        boolean invalidBatch = (commands == null || msgCtx == null || msgCtx.length == 0 || msgCtx[0] == null);
+                        if (invalidBatch || msgCtx[0].isNoOp()) {
+                            skippedConsensus++;
+                            logger.debug(
+                                    "Skipping replay for cid {} (invalidBatch={}, commandsNull={}, msgCtxNull={}, msgCtxLen={}, firstCtxNull={}, noOp={})",
+                                    cid,
+                                    invalidBatch,
+                                    (commands == null),
+                                    (msgCtx == null),
+                                    (msgCtx == null ? -1 : msgCtx.length),
+                                    (msgCtx != null && msgCtx.length > 0 && msgCtx[0] == null),
+                                    (!invalidBatch && msgCtx[0].isNoOp()));
+                            continue;
+                        }
+
+                        replayedConsensus++;
+                        appExecuteBatch(commands, msgCtx, false);
+                        if (replayedConsensus % 100 == 0 || cid == lastCID) {
+                            logger.info("Replay progress: replayed={}, skipped={}, currentCID={}",
+                                    replayedConsensus,
+                                    skippedConsensus,
+                                    cid);
+                        }
+
+                    } catch (Exception e) {
+                        logger.error("Failed to process and verify batched requests for cid {}", cid, e);
+                        if (e instanceof ArrayIndexOutOfBoundsException) {
+                            logger.info("Last checkpoint, last consensus ID (CID): {}", state.getLastCheckpointCID());
+                            logger.info("Last CID: {}", state.getLastCID());
+                            logger.info("number of messages expected to be in the batch: {}",
+                                    (state.getLastCID() - state.getLastCheckpointCID() + 1));
+                            logger.info("number of messages in the batch: {}",
+                                    (state.getMessageBatches() == null ? -1 : state.getMessageBatches().length));
+                        }
+                    }
+
+                }
+                logger.info("Finished state replay: replayed={}, skipped={}, lastCID={}",
+                        replayedConsensus,
+                        skippedConsensus,
+                        lastCID);
+            } finally {
+                stateLock.unlock();
+                logger.info("Released state lock after applying received state");
             }
-            logger.info("Finished state replay: replayed={}, skipped={}, lastCID={}",
-                    replayedConsensus,
-                    skippedConsensus,
-                    lastCID);
-            stateLock.unlock();
-            logger.info("Released state lock after applying received state");
         } else {
             logger.warn("setState received unsupported ApplicationState implementation: {}",
                     (recvState == null ? "null" : recvState.getClass().getName()));

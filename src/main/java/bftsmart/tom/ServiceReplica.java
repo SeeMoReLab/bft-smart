@@ -16,6 +16,7 @@
  */
 package bftsmart.tom;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.locks.Condition;
@@ -317,6 +318,57 @@ public class ServiceReplica {
 
         for (TOMMessage[] requestsFromConsensus : requests) {
 
+            if (requestsFromConsensus == null || requestsFromConsensus.length == 0) {
+                int cid = (consId != null && consensusCount < consId.length) ? consId[consensusCount] : -1;
+                int regency = (regencies != null && consensusCount < regencies.length) ? regencies[consensusCount] : -1;
+                int leader = (leaders != null && consensusCount < leaders.length) ? leaders[consensusCount] : -1;
+                CertifiedDecision deliveredDecision =
+                        (cDecs != null && consensusCount < cDecs.length) ? cDecs[consensusCount] : null;
+                byte[] decidedValue = (deliveredDecision != null) ? deliveredDecision.getDecision() : null;
+                Integer decidedMessageCount = extractBatchMessageCount(decidedValue);
+                if (decidedMessageCount == null) {
+                    throw new IllegalStateException(
+                            "Consensus " + cid + " delivered empty request array but decided value is null/malformed");
+                }
+                if (decidedMessageCount != 0) {
+                    throw new IllegalStateException(
+                            "Consensus " + cid + " delivered empty request array but decided value encodes "
+                                    + decidedMessageCount + " messages");
+                }
+
+                logger.warn(
+                        "Consensus {} delivered with empty request array; synthesizing no-op entry to preserve state-log continuity",
+                        cid);
+
+                if (this.recoverer != null) {
+                    byte[][] batch = {decidedValue};
+                    MessageContext[] msgCtx = new MessageContext[1];
+                    msgCtx[0] = new MessageContext(
+                            -1,
+                            SVController.getCurrentViewId(),
+                            TOMMessageType.ORDERED_REQUEST,
+                            -1,
+                            -1,
+                            -1,
+                            -1,
+                            null,
+                            0L,
+                            0,
+                            0L,
+                            regency,
+                            leader,
+                            cid,
+                            (deliveredDecision != null) ? deliveredDecision.getConsMessages() : null,
+                            null,
+                            true);
+                    msgCtx[0].setLastInBatch();
+                    this.recoverer.noOp(cid, batch, msgCtx);
+                }
+
+                consensusCount++;
+                continue;
+            }
+
             TOMMessage firstRequest = requestsFromConsensus[0];
             int requestCount = 0;
             noop = true;
@@ -481,6 +533,33 @@ public class ServiceReplica {
             }
             //DEBUG
             logger.debug("BATCHEXECUTOR END");
+        }
+    }
+
+    private Integer extractBatchMessageCount(byte[] decidedValue) {
+        if (decidedValue == null || decidedValue.length < (Long.BYTES + Integer.BYTES + Integer.BYTES)) {
+            return null;
+        }
+        try {
+            ByteBuffer proposalBuffer = ByteBuffer.wrap(decidedValue);
+            proposalBuffer.getLong(); // timestamp
+            int numberOfNonces = proposalBuffer.getInt();
+            if (numberOfNonces < 0) {
+                return null;
+            }
+            if (numberOfNonces > 0) {
+                if (proposalBuffer.remaining() < (Long.BYTES + Integer.BYTES)) {
+                    return null;
+                }
+                proposalBuffer.getLong(); // seed
+            }
+            if (proposalBuffer.remaining() < Integer.BYTES) {
+                return null;
+            }
+            int numberOfMessages = proposalBuffer.getInt();
+            return numberOfMessages >= 0 ? numberOfMessages : null;
+        } catch (RuntimeException ignored) {
+            return null;
         }
     }
 
