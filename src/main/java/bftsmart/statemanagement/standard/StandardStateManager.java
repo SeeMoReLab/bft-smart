@@ -16,13 +16,14 @@
 package bftsmart.statemanagement.standard;
 
 import bftsmart.statemanagement.StateManager;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Queue;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.Random;
 
@@ -180,20 +181,35 @@ public class StandardStateManager extends StateManager {
                     SVController.getStaticConf().getProcessId(),
                     sendState);
 
+            long preparationStartNanos = System.nanoTime();
             ApplicationState thisState = dt.getRecoverer().getState(msg.getCID(), sendState);
             if (thisState == null) {
 
                 logger.warn("For some reason, I am sending a void state");
                 thisState = dt.getRecoverer().getState(-1, sendState);
             }
+            long preparationDurationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - preparationStartNanos);
             int serializedBytes = (thisState != null && thisState.getSerializedState() != null)
                     ? thisState.getSerializedState().length : -1;
-            logger.info("Preparing SM_REPLY to replica {} for CID {} (hasState={}, serializedBytes={}, lastCID={})",
-                    msg.getSender(),
-                    msg.getCID(),
-                    (thisState != null && thisState.hasState()),
-                    serializedBytes,
-                    (thisState != null ? thisState.getLastCID() : -1));
+            if (sendState) {
+                logger.info(
+                        "Prepared full state for SM_REPLY to replica {} for CID {} in {} ms (hasState={}, serializedBytes={}, lastCID={})",
+                        msg.getSender(),
+                        msg.getCID(),
+                        preparationDurationMs,
+                        (thisState != null && thisState.hasState()),
+                        serializedBytes,
+                        (thisState != null ? thisState.getLastCID() : -1));
+            } else {
+                logger.info(
+                        "Prepared state-transfer hash/proof payload for SM_REPLY to replica {} for CID {} in {} ms (hasState={}, serializedBytes={}, lastCID={})",
+                        msg.getSender(),
+                        msg.getCID(),
+                        preparationDurationMs,
+                        (thisState != null && thisState.hasState()),
+                        serializedBytes,
+                        (thisState != null ? thisState.getLastCID() : -1));
+            }
 
             int[] targets = {msg.getSender()};
             SMMessage smsg = new StandardSMMessage(SVController.getStaticConf().getProcessId(),
@@ -249,7 +265,8 @@ public class StandardStateManager extends StateManager {
                     senderRegencies.put(msg.getSender(), msg.getRegency());
                     senderLeaders.put(msg.getSender(), msg.getLeader());
                     senderViews.put(msg.getSender(), msg.getView());
-                    senderProofs.put(msg.getSender(), replyState.getCertifiedDecision(SVController));
+                    CertifiedDecision replyProof = replyState.getCertifiedDecision(SVController);
+                    senderProofs.put(msg.getSender(), replyProof);
                     if (enoughRegencies(msg.getRegency())) {
                         currentRegency = msg.getRegency();
                     }
@@ -260,7 +277,13 @@ public class StandardStateManager extends StateManager {
                         currentView = msg.getView();
                     }
                     if (enoughProofs(waitingCID, this.tomLayer.getSynchronizer().getLCManager())) {
-                        currentProof = replyState.getCertifiedDecision(SVController);
+                        currentProof = selectValidProof(waitingCID, this.tomLayer.getSynchronizer().getLCManager());
+                        if (currentProof == null) {
+                            logger.warn(
+                                    "Proof quorum reached for CID {} but no valid proof could be selected from senderProofs (size={})",
+                                    waitingCID,
+                                    senderProofs.size());
+                        }
                     }
 
                 } else {
@@ -287,30 +310,142 @@ public class StandardStateManager extends StateManager {
                         waitingCID,
                         getReplies(),
                         SVController.getCurrentViewF());
+                CertifiedDecision senderProof = senderProofs.get(msg.getSender());
+                int senderProofSize = (senderProof != null && senderProof.getConsMessages() != null)
+                        ? senderProof.getConsMessages().size() : -1;
+                logger.info(
+                        "SM_REPLY details from replica {} for CID {}: hasState={}, stateLastCID={}, stateHash={}, proofPresent={}, proofMessages={}",
+                        msg.getSender(),
+                        waitingCID,
+                        replyState.hasState(),
+                        replyState.getLastCID(),
+                        shortHash(replyState.getStateHash()),
+                        (senderProof != null),
+                        senderProofSize);
 
                 logger.debug("Verifying more than F replies");
                 if (enoughReplies()) {
                     logger.debug("More than F confirmed");
-                    ApplicationState otherReplicaState = getOtherReplicaState();
                     int haveState = 0;
-                    if (state != null) {
-                        byte[] hash = null;
-                        hash = tomLayer.computeHash(state.getSerializedState());
-                        if (otherReplicaState != null) {
-                            if (Arrays.equals(hash, otherReplicaState.getStateHash())) {
-                                haveState = 1;
-                            } else if (getNumEqualStates() > SVController.getCurrentViewF()) {
-                                haveState = -1;
+                    int matchingHashReplies = 0;
+                    int bestHashSupport = 0;
+                    String bestHashShort = "none";
+                    int comparisonRepliesTotal = 0;
+                    int comparisonRepliesWithHash = 0;
+                    int comparisonRepliesWithoutHash = 0;
+                    boolean expectedReplicaRepliedWithoutState = false;
+
+                    ApplicationState expectedReplicaState = senderStates.get(replica);
+                    if (expectedReplicaState != null && expectedReplicaState.getSerializedState() != null) {
+                        state = expectedReplicaState;
+                    } else if (expectedReplicaState != null && state == null) {
+                        expectedReplicaRepliedWithoutState = true;
+                    }
+
+                    if (state != null && state.getSerializedState() != null) {
+                        byte[] expectedSerializedStateHash = tomLayer.computeHash(state.getSerializedState());
+                        String expectedHashKey = hashKey(expectedSerializedStateHash);
+
+                        Map<String, Integer> hashSupport = new HashMap<>();
+                        Map<String, String> hashPreview = new HashMap<>();
+
+                        int[] processes = SVController.getCurrentViewProcesses();
+                        for (int process : processes) {
+                            if (process == replica) {
+                                continue;
+                            }
+
+                            ApplicationState otherState = senderStates.get(process);
+                            if (otherState == null) {
+                                continue;
+                            }
+
+                            comparisonRepliesTotal++;
+                            byte[] otherStateHash = otherState.getStateHash();
+                            int otherSerializedBytes = (otherState.getSerializedState() != null)
+                                    ? otherState.getSerializedState().length : -1;
+                            CertifiedDecision otherProof = senderProofs.get(process);
+                            boolean otherProofPresent = (otherProof != null);
+                            int otherProofSize = (otherProof != null && otherProof.getConsMessages() != null)
+                                    ? otherProof.getConsMessages().size() : -1;
+
+                            if (otherStateHash == null) {
+                                comparisonRepliesWithoutHash++;
+                                logger.info(
+                                        "State transfer comparison reply for CID {} from replica {} has no state hash (hasState={}, stateLastCID={}, serializedBytes={}, proofPresent={}, proofMessages={})",
+                                        waitingCID,
+                                        process,
+                                        otherState.hasState(),
+                                        otherState.getLastCID(),
+                                        otherSerializedBytes,
+                                        otherProofPresent,
+                                        otherProofSize);
+                                continue;
+                            }
+
+                            comparisonRepliesWithHash++;
+                            String otherHashKey = hashKey(otherStateHash);
+                            int support = hashSupport.getOrDefault(otherHashKey, 0) + 1;
+                            hashSupport.put(otherHashKey, support);
+                            hashPreview.put(otherHashKey, shortHash(otherStateHash));
+
+                            logger.info(
+                                    "State transfer comparison reply for CID {} from replica {} contributed hash {} (support={}, hasState={}, stateLastCID={}, serializedBytes={}, proofPresent={}, proofMessages={})",
+                                    waitingCID,
+                                    process,
+                                    hashPreview.get(otherHashKey),
+                                    support,
+                                    otherState.hasState(),
+                                    otherState.getLastCID(),
+                                    otherSerializedBytes,
+                                    otherProofPresent,
+                                    otherProofSize);
+                        }
+
+                        matchingHashReplies = hashSupport.getOrDefault(expectedHashKey, 0);
+                        for (Map.Entry<String, Integer> hashEntry : hashSupport.entrySet()) {
+                            int support = hashEntry.getValue();
+                            if (support > bestHashSupport) {
+                                bestHashSupport = support;
+                                bestHashShort = hashPreview.get(hashEntry.getKey());
                             }
                         }
-                        TreeMap<Integer, TOMMessage> lastReplies = ((DefaultApplicationState) state).getLastReplies();
-                        logger.debug("DefaultApplicationState lastReplies TreeMap :: size=" + lastReplies.size());
+
+                        if (matchingHashReplies > SVController.getCurrentViewF()) {
+                            haveState = 1;
+                        } else if (bestHashSupport > SVController.getCurrentViewF()) {
+                            haveState = -1;
+                        }
+
+                        logger.info(
+                                "Expected full-state hash for CID {} from replica {} is {} (matchingHashReplies={}, bestHashSupport={}, bestHash={}, comparisonRepliesTotal={}, comparisonRepliesWithHash={}, comparisonRepliesWithoutHash={})",
+                                waitingCID,
+                                replica,
+                                shortHash(expectedSerializedStateHash),
+                                matchingHashReplies,
+                                bestHashSupport,
+                                bestHashShort,
+                                comparisonRepliesTotal,
+                                comparisonRepliesWithHash,
+                                comparisonRepliesWithoutHash);
+                    } else {
+                        logger.info(
+                                "Expected replica {} has not provided a full serialized state for CID {} yet (expectedReplicaStatePresent={}, expectedReplicaRepliedWithoutState={})",
+                                replica,
+                                waitingCID,
+                                (expectedReplicaState != null),
+                                expectedReplicaRepliedWithoutState);
                     }
                     logger.info(
-                            "State transfer gates for CID {}: haveState={}, otherReplicaStatePresent={}, currentRegency={}, currentLeader={}, currentViewPresent={}, proofPresent={}, appStateOnly={}, replies={}",
+                            "State transfer gates for CID {}: haveState={}, matchingHashReplies={}, bestHashSupport={}, bestHash={}, comparisonRepliesTotal={}, comparisonRepliesWithHash={}, comparisonRepliesWithoutHash={}, currentRegency={}, currentLeader={}, currentViewPresent={}, proofPresent={}, appStateOnly={}, replies={}",
                             waitingCID,
                             haveState,
-                            (otherReplicaState != null),
+                            matchingHashReplies,
+                            bestHashSupport,
+                            bestHashShort,
+                            comparisonRepliesTotal,
+                            comparisonRepliesWithHash,
+                            comparisonRepliesWithoutHash,
                             currentRegency,
                             currentLeader,
                             (currentView != null),
@@ -318,7 +453,7 @@ public class StandardStateManager extends StateManager {
                             appStateOnly,
                             getReplies());
 
-                    if (otherReplicaState != null && haveState == 1 && currentRegency > -1
+                    if (haveState == 1 && currentRegency > -1
                             && currentLeader > -1 && currentView != null && (!isBFT || currentProof != null || appStateOnly)) {
 
                         logger.info("Received state. Will install it (CID {}, expectedReplica {}, stateLastCID {})",
@@ -386,6 +521,7 @@ public class StandardStateManager extends StateManager {
                         cancelPeriodicStateRequestRetry();
                         waitingCID = -1;
                         targetCID = -1;
+                        int installedLastCID = state.getLastCID();
                         logger.info("Invoking DeliveryThread.update with transferred state (lastCID={})", state.getLastCID());
                         dt.update(state);
                         logger.info("DeliveryThread.update completed (lastCID={})", state.getLastCID());
@@ -434,31 +570,7 @@ public class StandardStateManager extends StateManager {
                         if (appStateOnly) {
                             appStateOnly = false;
                             logger.info("Resuming leader-change protocol after app-state-only transfer");
-                            tomLayer.getSynchronizer().resumeLC();
-                        }
-                    } else if (otherReplicaState == null && (SVController.getCurrentViewN() / 2) < getReplies()) {
-                        int retryCID = (targetCID >= 0 ? targetCID : waitingCID);
-                        logger.info(
-                                "State transfer branch (CID {}): missing comparison state despite replies={} (> N/2={}), resetting and{}",
-                                waitingCID,
-                                getReplies(),
-                                (SVController.getCurrentViewN() / 2),
-                                (appStateOnly ? " re-requesting app state" : " waiting for next trigger"));
-                        cancelPeriodicStateRequestRetry();
-                        waitingCID = -1;
-                        if (!appStateOnly) {
-                            targetCID = -1;
-                        }
-                        reset();
-
-                        if (stateTimer != null) {
-                            stateTimer.cancel();
-                        }
-
-                        if (appStateOnly) {
-                            waitingCID = retryCID;
-                            logger.info("Retrying app-state transfer after missing comparison state for CID {}", waitingCID);
-                            requestState();
+                            tomLayer.getSynchronizer().resumeLC(installedLastCID);
                         }
                     } else if (haveState == -1) {
                         logger.info(
@@ -473,13 +585,41 @@ public class StandardStateManager extends StateManager {
                         if (stateTimer != null) {
                             stateTimer.cancel();
                         }
-                    } else if (haveState == 0 && (SVController.getCurrentViewN() - SVController.getCurrentViewF()) <= getReplies()) {
-
+                    } else if (expectedReplicaRepliedWithoutState && (SVController.getCurrentViewN() / 2) < getReplies()) {
+                        int staleWaitingCID = waitingCID;
+                        int staleTargetCID = targetCID;
                         logger.info(
-                                "State transfer branch (CID {}): could not obtain installable state with replies={} (needed>={}); clearing waitingCID",
+                                "State transfer branch (CID {}): expected replica {} replied without full serialized state; abandoning current transfer and waiting for next trigger (targetCID={}, appStateOnly={}, replies={})",
+                                waitingCID,
+                                replica,
+                                targetCID,
+                                appStateOnly,
+                                getReplies());
+                        cancelPeriodicStateRequestRetry();
+                        waitingCID = -1;
+                        targetCID = -1;
+                        reset();
+                        if (stateTimer != null) {
+                            stateTimer.cancel();
+                        }
+                        logger.info(
+                                "State transfer state cleared after missing full-state reply (previousWaitingCID={}, previousTargetCID={})",
+                                staleWaitingCID,
+                                staleTargetCID);
+                    } else if (haveState == 0 && (SVController.getCurrentViewN() - SVController.getCurrentViewF()) <= getReplies()) {
+                        int staleWaitingCID = waitingCID;
+                        int staleTargetCID = targetCID;
+                        logger.info(
+                                "State transfer branch (CID {}): could not obtain installable state with replies={} (needed>={}); clearing transfer state (targetCID={}, appStateOnly={}, expectedReplica={}, matchingHashReplies={}, bestHashSupport={}, comparisonRepliesWithHash={})",
                                 waitingCID,
                                 getReplies(),
-                                (SVController.getCurrentViewN() - SVController.getCurrentViewF()));
+                                (SVController.getCurrentViewN() - SVController.getCurrentViewF()),
+                                targetCID,
+                                appStateOnly,
+                                replica,
+                                matchingHashReplies,
+                                bestHashSupport,
+                                comparisonRepliesWithHash);
                         reset();
                         if (stateTimer != null) {
                             stateTimer.cancel();
@@ -487,12 +627,17 @@ public class StandardStateManager extends StateManager {
                         cancelPeriodicStateRequestRetry();
                         waitingCID = -1;
                         targetCID = -1;
-                        //requestState();
+                        logger.info(
+                                "State transfer state cleared after non-installable attempt (previousWaitingCID={}, previousTargetCID={})",
+                                staleWaitingCID,
+                                staleTargetCID);
                     } else {
-                        logger.info("State transfer not yet finished for CID {} (haveState={}, otherReplicaStatePresent={}, replies={}, required>{})",
+                        logger.info("State transfer not yet finished for CID {} (haveState={}, matchingHashReplies={}, bestHashSupport={}, comparisonRepliesWithHash={}, replies={}, required>{})",
                                 waitingCID,
                                 haveState,
-                                (otherReplicaState != null),
+                                matchingHashReplies,
+                                bestHashSupport,
+                                comparisonRepliesWithHash,
                                 getReplies(),
                                 SVController.getCurrentViewF());
 
@@ -509,43 +654,25 @@ public class StandardStateManager extends StateManager {
         }
     }
 
-    /**
-     * Search in the received states table for a state that was not sent by the
-     * expected replica. This is used to compare both states after received the
-     * state from expected and other replicas.
-     *
-     * @return The state sent from other replica
-     */
-    private ApplicationState getOtherReplicaState() {
-        int[] processes = SVController.getCurrentViewProcesses();
-        for (int process : processes) {
-            if (process == replica) {
-                continue;
-            } else {
-                ApplicationState otherState = senderStates.get(process);
-                if (otherState != null) {
-                    return otherState;
-                }
-            }
+    private String hashKey(byte[] hash) {
+        if (hash == null) {
+            return "null";
         }
-        return null;
+        StringBuilder builder = new StringBuilder(hash.length * 2);
+        for (byte b : hash) {
+            builder.append(Character.forDigit((b >>> 4) & 0xF, 16));
+            builder.append(Character.forDigit(b & 0xF, 16));
+        }
+        return builder.toString();
     }
 
-    private int getNumEqualStates() {
-        List<ApplicationState> states = new ArrayList<ApplicationState>(receivedStates());
-        int match = 0;
-        for (ApplicationState st1 : states) {
-            int count = 0;
-            for (ApplicationState st2 : states) {
-                if (st1 != null && st1.equals(st2)) {
-                    count++;
-                }
-            }
-            if (count > match) {
-                match = count;
-            }
+    private String shortHash(byte[] hash) {
+        if (hash == null) {
+            return "null";
         }
-        return match;
+        String key = hashKey(hash);
+        int previewChars = Math.min(16, key.length());
+        return key.substring(0, previewChars);
     }
 
 }

@@ -84,6 +84,13 @@ public class Synchronizer {
     private int tempBatchSize = -1;
     private boolean tempIAmLeader = false;
 
+    // Guards to make LC side effects idempotent per regency.
+    private final Object lcRegencyGuard = new Object();
+    private int syncSentRegency = -1;
+    private int finalisingRegency = -1;
+    private int finalisedRegency = -1;
+    private int pendingStateTransferRegency = -1;
+
     
     public Synchronizer(TOMLayer tom) {
         
@@ -313,7 +320,7 @@ public class Synchronizer {
             // Is the predicate "sound" true? Is the certificate for LastCID valid?
             if (lcManager.sound(lcManager.selectCollects(regency, currentCID)) && (!controller.getStaticConf().isBFT() || lcManager.hasValidProof(lastHighestCID))) {
 
-                finalise(regency, lastHighestCID, signedCollects, propose, batchSize, false);
+                finalise(regency, lastHighestCID, signedCollects, propose, batchSize, false, false);
             }
 
             ois.close();
@@ -963,6 +970,14 @@ public class Synchronizer {
 
             logger.debug("Sound predicate is true");
 
+            int previousSyncRegency = reserveSyncForRegency(regency);
+            if (previousSyncRegency < 0) {
+                logger.debug("Ignoring duplicate catch-up trigger for regency {}", regency);
+                return;
+            }
+
+            boolean syncSent = false;
+
             signedCollects = lcManager.getCollects(regency); // all original collects that the replica has received
 
             Decision dec = new Decision(-1); // the only purpose of this object is to obtain the batchsize,
@@ -995,10 +1010,21 @@ public class Synchronizer {
                 communication.send(this.controller.getCurrentViewOtherAcceptors(),
                         new LCMessage(this.controller.getStaticConf().getProcessId(), TOMUtil.SYNC, regency, payload));
 
-                finalise(regency, lastHighestCID, signedCollects, propose, batchSize, true);
+                syncSent = true;
+                finalise(regency, lastHighestCID, signedCollects, propose, batchSize, true, false);
 
             } catch (IOException ex) {
                 logger.error("Could not serialize message", ex);
+            } finally {
+                if (!syncSent) {
+                    rollbackSyncReservation(regency, previousSyncRegency);
+                }
+                try {
+                    if (out != null) out.close();
+                    if (bos != null) bos.close();
+                } catch (IOException ex) {
+                    logger.error("Could not serialize message", ex);
+                }
             }
         }
     }
@@ -1006,8 +1032,46 @@ public class Synchronizer {
     //This method is invoked by the state transfer protocol to notify the replica
     // that it can end synchronization
     public void resumeLC() {
+        resumeLC(-1);
+    }
 
-        Consensus cons = execManager.getConsensus(tempLastHighestCID.getCID());
+    public void resumeLC(int installedLastCID) {
+
+        CertifiedDecision pendingLastHighestCID = tempLastHighestCID;
+        if (pendingLastHighestCID == null) {
+            logger.warn("resumeLC invoked without pending synchronization context; ignoring request");
+            return;
+        }
+
+        int pendingCid = pendingLastHighestCID.getCID();
+        int lastExec = tom.getLastExec();
+
+        if (installedLastCID >= 0 && pendingCid < installedLastCID) {
+            logger.warn(
+                    "Skipping resumeLC because pending LC context is stale (pendingLastHighestCID={}, installedLastCID={}); waiting for a fresh leader-change round",
+                    pendingCid,
+                    installedLastCID);
+            clearPendingLCContext();
+            return;
+        }
+
+        if (pendingCid < lastExec) {
+            logger.warn(
+                    "Skipping resumeLC because pending LC context is behind local execution (pendingLastHighestCID={}, localLastExec={}); waiting for a fresh leader-change round",
+                    pendingCid,
+                    lastExec);
+            clearPendingLCContext();
+            return;
+        }
+
+        int pendingRegency = tempRegency;
+        HashSet<SignedObject> pendingSignedCollects = tempSignedCollects;
+        byte[] pendingPropose = tempPropose;
+        int pendingBatchSize = tempBatchSize;
+        boolean pendingIAmLeader = tempIAmLeader;
+        clearPendingLCContext();
+
+        Consensus cons = execManager.getConsensus(pendingCid);
         Epoch e = cons.getLastEpoch();
 
         int ets = cons.getEts();
@@ -1018,31 +1082,111 @@ public class Synchronizer {
             e.clear();
         }
 
-        byte[] hash = tom.computeHash(tempLastHighestCID.getDecision());
+        byte[] decision = pendingLastHighestCID.getDecision();
+        if (decision == null) {
+            logger.warn("Skipping resumeLC because pending LC decision payload is null for CID {}", pendingCid);
+            return;
+        }
+
+        byte[] hash = tom.computeHash(decision);
         e.propValueHash = hash;
-        e.propValue = tempLastHighestCID.getDecision();
+        e.propValue = decision;
 
-        e.deserializedPropValue = tom.checkProposedValue(tempLastHighestCID.getDecision(), false);
+        e.deserializedPropValue = tom.checkProposedValue(decision, false);
 
-        finalise(tempRegency, tempLastHighestCID,
-                tempSignedCollects, tempPropose, tempBatchSize, tempIAmLeader);
+        finalise(pendingRegency, pendingLastHighestCID,
+                pendingSignedCollects, pendingPropose, pendingBatchSize, pendingIAmLeader, true);
 
+    }
+
+    private void clearPendingLCContext() {
+        tempRegency = -1;
+        tempLastHighestCID = null;
+        tempSignedCollects = null;
+        tempPropose = null;
+        tempBatchSize = -1;
+        tempIAmLeader = false;
+    }
+
+    private int reserveSyncForRegency(int regency) {
+        synchronized (lcRegencyGuard) {
+            if (regency <= syncSentRegency) return -1;
+            int previousSyncRegency = syncSentRegency;
+            syncSentRegency = regency;
+            return previousSyncRegency;
+        }
+    }
+
+    private void rollbackSyncReservation(int regency, int previousSyncRegency) {
+        synchronized (lcRegencyGuard) {
+            if (syncSentRegency == regency) {
+                syncSentRegency = previousSyncRegency;
+            }
+        }
+    }
+
+    private boolean beginFinaliseAttempt(int regency, boolean fromStateTransferResume) {
+        synchronized (lcRegencyGuard) {
+            if (regency <= finalisedRegency) {
+                logger.info("Ignoring finalise for regency {} because regency {} is already finalised", regency, finalisedRegency);
+                return false;
+            }
+            if (regency == finalisingRegency) {
+                logger.info("Ignoring concurrent duplicate finalise for regency {}", regency);
+                return false;
+            }
+            if (!fromStateTransferResume && regency == pendingStateTransferRegency) {
+                logger.info("Ignoring duplicate finalise for regency {} while waiting for state transfer resume", regency);
+                return false;
+            }
+            if (fromStateTransferResume && regency == pendingStateTransferRegency) {
+                pendingStateTransferRegency = -1;
+            }
+            finalisingRegency = regency;
+            return true;
+        }
+    }
+
+    private void endFinaliseAttempt(int regency, boolean completed, boolean deferredToStateTransfer) {
+        synchronized (lcRegencyGuard) {
+            if (deferredToStateTransfer && regency > pendingStateTransferRegency) {
+                pendingStateTransferRegency = regency;
+            }
+            if (completed && regency > finalisedRegency) {
+                finalisedRegency = regency;
+                if (pendingStateTransferRegency == regency) {
+                    pendingStateTransferRegency = -1;
+                }
+            }
+            if (finalisingRegency == regency) {
+                finalisingRegency = -1;
+            }
+        }
     }
 
     // this method is called on all replicas, and serves to verify and apply the
     // information sent in the catch-up message
     private void finalise(int regency, CertifiedDecision lastHighestCID,
-            HashSet<SignedObject> signedCollects, byte[] propose, int batchSize, boolean iAmLeader) {
+            HashSet<SignedObject> signedCollects, byte[] propose, int batchSize, boolean iAmLeader,
+            boolean fromStateTransferResume) {
 
+        if (!beginFinaliseAttempt(regency, fromStateTransferResume)) {
+            return;
+        }
+
+        boolean completed = false;
+        boolean deferredToStateTransfer = false;
+
+        try {
         int currentCID = lastHighestCID.getCID() + 1;
-        logger.debug("Final stage of LC protocol");
+        logger.info("Final stage of LC protocol for regency {}", regency);
         int me = this.controller.getStaticConf().getProcessId();
         Consensus cons = null;
         Epoch e = null;
 
         if (tom.getLastExec() + 1 < lastHighestCID.getCID()) { // is this a delayed replica?
 
-            logger.info("NEEDING TO USE STATE TRANSFER!! (" + lastHighestCID.getCID() + ")");
+            logger.info("NEEDING TO USE STATE TRANSFER!! (current: " + tom.getLastExec() + ", target: " + lastHighestCID.getCID() + ")");
 
             tempRegency = regency;
             tempLastHighestCID = lastHighestCID;
@@ -1051,6 +1195,7 @@ public class Synchronizer {
             tempBatchSize = batchSize;
             tempIAmLeader = iAmLeader;
 
+            deferredToStateTransfer = true;
             execManager.getStoppedMsgs().add(acceptor.getFactory().createPropose(currentCID, 0, propose));
             stateManager.requestAppState(lastHighestCID.getCID());
 
@@ -1248,8 +1393,12 @@ public class Synchronizer {
             }
 
             requestsTimer.onViewInstalled();
+            completed = true;
         } else {
             logger.warn("Sync phase failed for regency" + regency);
+        }
+        } finally {
+            endFinaliseAttempt(regency, completed, deferredToStateTransfer);
         }
     }
 

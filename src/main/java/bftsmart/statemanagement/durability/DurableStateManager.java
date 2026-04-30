@@ -111,27 +111,34 @@ public class DurableStateManager extends StateManager {
         if (SVController.getStaticConf().isStateTransferEnabled()
                 && dt.getRecoverer() != null) {
             logger.debug("The state transfer protocol is enabled");
-            logger.info("Received SM_REQUEST from replica {} for CID {}",
-                    msg.getSender(),
-                    msg.getCID());
             CSTSMMessage cstMsg = (CSTSMMessage) msg;
             CSTRequestF1 cstConfig = cstMsg.getCstConfig();
-            boolean sendState = cstConfig.getCheckpointReplica() == SVController
-                    .getStaticConf().getProcessId();
+            int myId = SVController.getStaticConf().getProcessId();
+            boolean sendState = cstConfig.getCheckpointReplica() == myId;
+            String localRole = localCstRole(cstConfig, myId);
+            logger.info(
+                    "Received SM_REQUEST from replica {} for CID {} (checkpointReplica={}, logLowerReplica={}, logUpperReplica={}, localReplica={}, localRole={})",
+                    msg.getSender(),
+                    msg.getCID(),
+                    cstConfig.getCheckpointReplica(),
+                    cstConfig.getLogLower(),
+                    cstConfig.getLogUpper(),
+                    myId,
+                    localRole);
             if (sendState) {
                 logger.debug("I should be the one sending the state");
             }
 
-            logger.info("State asked by replica {} for CID {} (sendState={})",
+            logger.info("State asked by replica {} for CID {} (sendState={}, localRole={})",
                     msg.getSender(),
                     msg.getCID(),
-                    sendState);
+                    sendState,
+                    localRole);
 
             int[] targets = {msg.getSender()};
             InetSocketAddress address = SVController.getCurrentView().getAddress(
-                    SVController.getStaticConf().getProcessId());
+                    myId);
             String myIp = address.getHostName();
-            int myId = SVController.getStaticConf().getProcessId();
             int port = 4444 + myId;
             address = new InetSocketAddress(myIp, port);
             cstConfig.setAddress(address);
@@ -143,14 +150,37 @@ public class DurableStateManager extends StateManager {
             tomLayer.getCommunication().send(targets, reply);
             
             if (stateThread == null) {
+                logger.info("Starting state sender server for CID {} on replica {} (localRole={}, port={})",
+                        msg.getCID(),
+                        myId,
+                        localRole,
+                        port);
                 
                 StateSenderServer stateServer = new StateSenderServer(port);
                 stateServer.setRecoverable(dt.getRecoverer());
                 stateServer.setRequest(cstConfig);
                 stateThread = new Thread(stateServer);
                 stateThread.start();
+            } else {
+                logger.info("State sender server already active on replica {} while handling CID {} (localRole={})",
+                        myId,
+                        msg.getCID(),
+                        localRole);
             }
         }
+    }
+
+    private String localCstRole(CSTRequestF1 cstConfig, int processId) {
+        if (cstConfig.getCheckpointReplica() == processId) {
+            return "CHECKPOINT_FULL_STATE";
+        }
+        if (cstConfig.getLogLower() == processId) {
+            return "LOG_LOWER";
+        }
+        if (cstConfig.getLogUpper() == processId) {
+            return "LOG_UPPER";
+        }
+        return "UNASSIGNED";
     }
 
     @Override

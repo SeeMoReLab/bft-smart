@@ -161,6 +161,15 @@ public abstract class StateManager {
         boolean result = counter > SVController.getQuorum();
         return result;
     }
+
+    protected CertifiedDecision selectValidProof(int cid, LCManager lc) {
+        for (CertifiedDecision cDec : senderProofs.values()) {
+            if (cDec != null && cid == proofIsConsistent(cDec.getConsMessages()) && lc.hasValidProof(cDec)) {
+                return cDec;
+            }
+        }
+        return null;
+    }
     
     /**
      * Clear the collections and state hold by this object. Calls clear() in the
