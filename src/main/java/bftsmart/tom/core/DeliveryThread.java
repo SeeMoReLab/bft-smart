@@ -299,6 +299,7 @@ public final class DeliveryThread extends Thread {
 							d.firstMessageProposed.timestamp = requests[count][0].timestamp;
 							d.firstMessageProposed.seed = requests[count][0].seed;
 							d.firstMessageProposed.numOfNonces = requests[count][0].numOfNonces;
+							copyBenchmarkCounters(d.firstMessageProposed, requests[count][0]);
 						}
 
 						count++;
@@ -367,6 +368,14 @@ public final class DeliveryThread extends Thread {
 					controller.getStaticConf().getUseSignatures() == 1);
 			TOMMessage[] decoded = batchReader.deserialiseRequests(controller);
 			if (decoded != null) {
+				// Decoded TOMMessages are rebuilt from bytes, so transient timing
+				// counters are lost. Restore benchmark counters from the decision's
+				// first proposed message when this matches the decoded first request.
+				if (decoded.length > 0
+						&& dec.firstMessageProposed != null
+						&& decoded[0].equals(dec.firstMessageProposed)) {
+					copyBenchmarkCounters(dec.firstMessageProposed, decoded[0]);
+				}
 				if (decisionEpoch != null) {
 					decisionEpoch.deserializedPropValue = decoded;
 				}
@@ -389,6 +398,19 @@ public final class DeliveryThread extends Thread {
 				"Consensus {} has neither decodable decided value nor cached requests; returning empty request array",
 				dec.getConsensusId());
 		return new TOMMessage[0];
+	}
+
+	private static void copyBenchmarkCounters(TOMMessage source, TOMMessage target) {
+		if (source == null || target == null) {
+			return;
+		}
+		target.consensusStartTime = source.consensusStartTime;
+		target.proposeReceivedTime = source.proposeReceivedTime;
+		target.writeSentTime = source.writeSentTime;
+		target.acceptSentTime = source.acceptSentTime;
+		target.decisionTime = source.decisionTime;
+		target.receptionTime = source.receptionTime;
+		target.receptionTimestamp = source.receptionTimestamp;
 	}
 
 	public void deliverUnordered(TOMMessage request, int regency) {
